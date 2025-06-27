@@ -1,11 +1,18 @@
+import datetime
+import numpy as np
+import pandas as pd
 import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
+from matplotlib.ticker import MultipleLocator
+from matplotlib.lines import Line2D
+import streamlit as st
+import yfinance as yf
 from ta.momentum import RSIIndicator
-
+from ta.volatility import BollingerBands
+from scipy.signal import find_peaks
+import plotly.graph_objects as go
 # --- Inserted function: plot_spx_monthly_ma_chart() ---
 def plot_spx_monthly_ma_chart():
-    import yfinance as yf
-    import pandas as pd
-    import matplotlib.dates as mdates
 
     # SPX laden (Monthly)
     df = yf.download("^GSPC", start="2015-01-01", interval="1mo")
@@ -30,17 +37,7 @@ def plot_spx_monthly_ma_chart():
     ax.xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m'))
     plt.xticks(rotation=45)
     st.pyplot(fig)
-import streamlit as st
-import yfinance as yf
-import pandas as pd
-import matplotlib.pyplot as plt
-import numpy as np
-from ta.momentum import RSIIndicator
-from ta.volatility import BollingerBands
-import matplotlib.dates as mdates
-import plotly.graph_objects as go
-from scipy.signal import find_peaks
-import datetime
+
 
 st.set_page_config(layout="wide")
 st.title("📊 Marktanalyse-Dashboard: Buy-/Test-Zonen & Sektorrotation")
@@ -61,6 +58,10 @@ st.sidebar.markdown(f"**Ausgewähltes Intervall:** {resolution_note.get(interval
 with st.sidebar.expander("🔍 Anzeigen"):
     show_indicators = st.checkbox("Indikatoren anzeigen", value=True)
     show_signals = st.checkbox("Buy/Test Signale anzeigen", value=True)
+    show_fib_extensions = st.sidebar.checkbox("Fibonacci Extensions anzeigen", value=True)
+
+# Neu: Auswahlfeld für Trendrichtung
+trend_direction = st.sidebar.radio("Trendrichtung für Fibonacci", options=["Uptrend", "Downtrend"], index=0)
 
 # Dynamische Standardwerte für RSI/MA je nach Intervall
 if interval == "1h":
@@ -75,9 +76,6 @@ else:
     default_rsi_buy = 40
     default_rsi_test = 65
     default_ma_buy_distance = 3
-
-# Zusatzinfo unter Intervallauswahl
-st.sidebar.info("Hinweis: RSI- und MA-Schwellenwerte passen sich automatisch an das gewählte Intervall an.")
 
 ticker = st.sidebar.text_input("📈 Ticker", value="^GSPC")
 with st.sidebar.expander("📘 Tickerliste (Beispiele)"):
@@ -104,7 +102,7 @@ with st.sidebar.expander("📘 Tickerliste (Beispiele)"):
     - IWM → Russell 2000 ETF  
     - DIA → Dow Jones ETF  
     """)
-start_date = st.sidebar.date_input("📅 Startdatum", value=pd.to_datetime("2023-01-01"))
+start_date = st.sidebar.date_input("📅 Startdatum", value=pd.to_datetime("2024-01-01"))
 # Set default end date to tomorrow (today + 1 day), but only as default; if the user selects another date, use that.
 default_end_date = pd.to_datetime("today") + pd.Timedelta(days=1)
 end_date = st.sidebar.date_input("📅 Enddatum", value=default_end_date)
@@ -202,6 +200,53 @@ fib = {
     "1.0": low,
 }
 
+# Trendrichtung erkennen
+if close_series[-1] > close_series[0]:
+    trend = "up"
+else:
+    trend = "down"
+
+# Trend-Info in der Sidebar anzeigen (nach Definition von trend)
+st.markdown(f"**Aktueller Trend:** {'Aufwärts (Uptrend)' if trend == 'up' else 'Abwärts (Downtrend)'}")
+
+# Fibonacci-Extensions berechnen
+if trend_direction == "Uptrend":
+    fib_ext = {
+        "1.236": high + 0.236 * (high - low),
+        "1.382": high + 0.382 * (high - low),
+        "1.618": high + 0.618 * (high - low),
+        "2.0": high + 1.0 * (high - low),
+        "2.618": high + 1.618 * (high - low),
+    }
+else:  # Downtrend
+    fib_ext = {
+        "1.236": low - 0.236 * (high - low),
+        "1.382": low - 0.382 * (high - low),
+        "1.618": low - 0.618 * (high - low),
+        "2.0": low - 1.0 * (high - low),
+        "2.618": low - 1.618 * (high - low),
+    }
+
+if trend_direction == "Uptrend":
+    fib = {
+        "0.0": low,
+        "0.236": low + 0.236 * (high - low),
+        "0.382": low + 0.382 * (high - low),
+        "0.5": low + 0.5 * (high - low),
+        "0.618": low + 0.618 * (high - low),
+        "0.786": low + 0.786 * (high - low),
+        "1.0": high,
+    }
+else:  # Downtrend
+    fib = {
+        "0.0": high,
+        "0.236": high - 0.236 * (high - low),
+        "0.382": high - 0.382 * (high - low),
+        "0.5": high - 0.5 * (high - low),
+        "0.618": high - 0.618 * (high - low),
+        "0.786": high - 0.786 * (high - low),
+        "1.0": low,
+    }
 # Volumenprofil
 hist_vals, bin_edges = np.histogram(close_series, bins=price_bins)
 max_volume = max(hist_vals)
@@ -209,7 +254,7 @@ max_volume = max(hist_vals)
 # Plot: Matplotlib-Chart
 fig, ax = plt.subplots(figsize=(14, 8))
 # Y-Achsen-Skalierung optimieren: Skalenabstand auf 100 Punkte
-from matplotlib.ticker import MultipleLocator
+
 ax.yaxis.set_major_locator(MultipleLocator(100))  # Skalenabstand auf 100 Punkte setzen
 ax.plot(close_series.index, close_series.values, label='Close', linewidth=2.5, color='#00bfff')
 ax.plot(data['MA50'], label='MA50', linestyle='--', color='#ffaa00')
@@ -381,7 +426,6 @@ for i, zone in enumerate(confluence_zones):
     # --- Kursziel unterhalb der aktuellen Zone anzeigen ---
     # Berechnung des ATR (14 Perioden)
     atr = data['High'].rolling(window=14).max() - data['Low'].rolling(window=14).min()
-    import pandas as pd  # ensure pd is available in this scope
     atr_value = atr.iloc[-1] if isinstance(atr, pd.Series) else atr
     # Kursziel: Unterkante der Zone - ATR * 1.5
     kursziel = zone_bottom - (atr_value * 1.5)
@@ -395,7 +439,7 @@ for i, zone in enumerate(confluence_zones):
         fontsize=8,
         color='white'
     )
-from matplotlib.lines import Line2D
+
 custom_lines = [
     Line2D([0], [0], color='darkgreen', lw=2, linestyle='--', label='Confluence Zone (3/3)'),
     Line2D([0], [0], color='orange', lw=2, linestyle='--', label='Confluence Zone (2/3)'),
@@ -407,6 +451,23 @@ for lvl, val in fib.items():
     ax.axhline(val, linestyle='--', alpha=0.7, label=f'Fib {lvl} → {val:.0f}', color='#cccccc')
 for lvl, val in fib.items():
     ax.text(data.index.min(), val, f'Fib {lvl}', color='#666666', fontsize=8, verticalalignment='bottom', horizontalalignment='left')
+
+if show_fib_extensions and 'fig3' in locals():
+    for lvl, val in fib_ext.items():
+        color = '#ff9999' if trend == "up" else '#99ccff'
+        fig3.add_hline(y=val, line=dict(dash='dot', color=color), opacity=0.5)
+        fig3.add_annotation(
+            x=plot_df.index[-1],
+            y=val,
+            text=f"Ext {lvl}: {val:.0f}",
+            showarrow=False,
+            font=dict(size=11, color=color),
+            bgcolor='rgba(255,255,255,0.2)',
+            bordercolor=color,
+            borderwidth=1,
+            xanchor='right',
+            yshift=15
+        )
 
 # Volumenprofil
 for count, edge in zip(hist_vals, bin_edges[:-1]):
@@ -587,7 +648,7 @@ export_df = pd.DataFrame({
     'Test_Zone': close_series.index.isin(test_zone.index)
 })
 csv = export_df.to_csv(index=False)
-st.download_button("📥 Exportiere Buy-/Test-Zonen als CSV", data=csv, file_name=f'{ticker}_zones.csv', mime='text/csv')
+#st.download_button("📥 Exportiere Buy-/Test-Zonen als CSV", data=csv, file_name=f'{ticker}_zones.csv', mime='text/csv')
 
 # Debug-Check: Sind Daten vollständig?
 st.write(data[['Open', 'High', 'Low', 'Close']].dropna().tail())  # Zeigt letzte 5 Zeilen mit Kursdaten
@@ -686,6 +747,22 @@ for zone in confluence_zones:
         yshift=0,
         xanchor='left'
     )
+if show_fib_extensions:
+    for lvl, val in fib_ext.items():
+        color = '#ff9999' if trend == "up" else '#99ccff'
+        fig3.add_hline(y=val, line=dict(dash='dot', color=color), opacity=0.5)
+        fig3.add_annotation(
+            x=plot_df.index[-1],
+            y=val,
+            text=f"Ext {lvl}: {val:.0f}",
+            showarrow=False,
+            font=dict(size=11, color=color),
+            bgcolor='rgba(255,255,255,0.2)',
+            bordercolor=color,
+            borderwidth=1,
+            xanchor='right',
+            yshift=15
+        )
 
 # Fibonacci-Level als horizontale Linien mit Annotation links oben, grau
 for lvl, val in fib.items():
@@ -789,18 +866,141 @@ def plot_bpspx_chart():
 
 # Expander für Makro-Charts mit neuen Checkboxen
 with st.expander("📊 Zusätzliche Makro-Charts"):
-    show_junk = st.checkbox("JUNK vs SPX anzeigen")
-    show_hyg = st.checkbox("HYG vs SPX anzeigen")
-    show_spx_ma = st.checkbox("SPX Monthly MAs anzeigen")
-    show_spxa200r = st.checkbox("SPXA200R anzeigen")
+    show_jnk_detail_chart = st.checkbox("JNK Detailchart anzeigen", value=True)
+    show_hyg_vs_spx = st.checkbox("HYG vs SPX anzeigen", value=True)
+    show_vix_vs_spx = st.checkbox("VIX vs SPX anzeigen", value=True)
+    show_spx_ma = st.checkbox("SPX Monthly MAs anzeigen", value=True)
+    show_spxa200r = st.checkbox("SPXA200R anzeigen", value=True)
+    show_vix_seasonality = st.checkbox("VIX Saisonalität anzeigen", value=True)
+    show_SP500_seasonality = st.checkbox("S&P500 Saisonalität anzeigen", value=True)
+    show_sp500_pe_ratio = st.checkbox("S&P500 PE Ratio anzeigen", value=True)
+
+    # JNK Detailchart anzeigen
+    if show_jnk_detail_chart:
+        import yfinance as yf
+        import matplotlib.pyplot as plt
+        import matplotlib.dates as mdates
+        from ta.momentum import RSIIndicator
+
+        start_date = "2023-06-01"
+        end_date = "2025-06-27"
+
+        jnk = yf.download("JNK", start=start_date, end=end_date)
+        spx = yf.download("^GSPC", start=start_date, end=end_date)
+
+        if not jnk.empty and not spx.empty:
+            rsi_jnk = RSIIndicator(close=jnk["Close"].squeeze(), window=14).rsi()
+
+            fig, axs = plt.subplots(3, 1, figsize=(14, 9), sharex=True, gridspec_kw={"height_ratios": [1, 2, 2]})
+            fig.suptitle("JNK vs SPX mit RSI (Detailansicht)", fontsize=16)
+
+            axs[0].plot(jnk.index, rsi_jnk, color='red', label='RSI (14)')
+            axs[0].axhline(70, color='gray', linestyle='--', linewidth=1)
+            axs[0].axhline(30, color='gray', linestyle='--', linewidth=1)
+            axs[0].axhline(50, color='gray', linestyle=':', linewidth=1)
+            axs[0].set_ylabel("RSI")
+            axs[0].legend(loc="upper left")
+            axs[0].grid(True)
+
+            axs[1].plot(jnk.index, jnk["Close"], color='green', label='JNK Close')
+            axs[1].set_ylabel("JNK")
+            axs[1].legend(loc="upper left")
+            axs[1].grid(True)
+
+            axs[2].plot(spx.index, spx["Close"], color='deepskyblue', label='SPX Close')
+            axs[2].set_ylabel("SPX")
+            axs[2].legend(loc="upper left")
+            axs[2].grid(True)
+
+            axs[2].xaxis.set_major_locator(mdates.MonthLocator(interval=2))
+            axs[2].xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m'))
+            plt.xticks(rotation=45)
+
+            plt.tight_layout(rect=[0, 0.03, 1, 0.97])
+            st.pyplot(fig)
 
 # Ensure all charts can be shown independently
-if 'show_junk' in locals() and show_junk:
+if 'show_junk' in locals() and show_jnk_detail_chart:
     plot_jnk_spx_chart()
-if 'show_hyg' in locals() and show_hyg:
+if 'show_hyg_vs_spx' in locals() and show_hyg_vs_spx:
     plot_hyg_chart()
+    # VIX vs SPX Chart mit RSI
+    if show_vix_vs_spx:
+        vix = yf.download("^VIX", start=start_date, end=end_date)
+        spx = yf.download("^GSPC", start=start_date, end=end_date)
+
+        vix_close = vix["Close"]
+        spx_close = spx["Close"]
+
+        rsi_vix = RSIIndicator(close=vix_close.squeeze(), window=14).rsi()
+
+        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 8), sharex=True)
+
+        ax1.plot(vix_close, label='VIX', color='black')
+        ax1.set_ylabel("VIX", color='black')
+        ax1.tick_params(axis='y', labelcolor='black')
+        ax1.legend(loc="upper left")
+
+        ax1_2 = ax1.twinx()
+        ax1_2.plot(spx_close, label='SPX', color='blue', alpha=0.6)
+        ax1_2.set_ylabel("SPX", color='blue')
+        ax1_2.tick_params(axis='y', labelcolor='blue')
+        ax1_2.legend(loc="upper right")
+        ax1.set_title("VIX vs SPX")
+
+        ax2.plot(rsi_vix, label="VIX RSI", color='red')
+        ax2.axhline(70, linestyle='--', color='gray')
+        ax2.axhline(30, linestyle='--', color='gray')
+        ax2.set_ylabel("RSI")
+        ax2.set_title("VIX RSI")
+        ax2.legend()
+
+        st.pyplot(fig)
+elif 'show_vix_vs_spx' in locals() and show_vix_vs_spx:
+    vix = yf.download("^VIX", start=start_date, end=end_date)
+    spx = yf.download("^GSPC", start=start_date, end=end_date)
+
+    vix_close = vix["Close"]
+    spx_close = spx["Close"]
+
+    rsi_vix = RSIIndicator(close=vix_close.squeeze(), window=14).rsi()
+
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 8), sharex=True)
+
+    ax1.plot(vix_close, label='VIX', color='black')
+    ax1.set_ylabel("VIX", color='black')
+    ax1.tick_params(axis='y', labelcolor='black')
+    ax1.legend(loc="upper left")
+
+    ax1_2 = ax1.twinx()
+    ax1_2.plot(spx_close, label='SPX', color='blue', alpha=0.6)
+    ax1_2.set_ylabel("SPX", color='blue')
+    ax1_2.tick_params(axis='y', labelcolor='blue')
+    ax1_2.legend(loc="upper right")
+    ax1.set_title("VIX vs SPX")
+
+    ax2.plot(rsi_vix, label="VIX RSI", color='red')
+    ax2.axhline(70, linestyle='--', color='gray')
+    ax2.axhline(30, linestyle='--', color='gray')
+    ax2.set_ylabel("RSI")
+    ax2.set_title("VIX RSI")
+    ax2.legend()
+
+    st.pyplot(fig)
+if 'show_vix_seasonality' in locals() and show_vix_seasonality:
+    st.markdown("### VIX Saisonalität (20-Jahres-Schnitt)")
+    st.image("images/vix_seasonality.png", use_container_width=True)
+    st.caption("Durchschnittliche saisonale Volatilität basierend auf 20 Jahren")
+if 'show_SP500_seasonality' in locals() and show_SP500_seasonality:
+    st.markdown("### S&P 500 Saisonalität")
+    st.image("images/S&P500seasonality.png", use_container_width=True)
+    st.caption("Durchschnittliche saisonale Volatilität basierend auf 20 Jahren")
 if 'show_spx_ma' in locals() and show_spx_ma:
     plot_spx_monthly_ma_chart()
+if 'show_sp500_pe_ratio' in locals() and show_sp500_pe_ratio:
+    st.markdown("### S&P 500 PE Ratio")
+    st.markdown("[📈 Zur Live-Grafik auf multpl.com](https://www.multpl.com/s-p-500-pe-ratio)")
+    st.caption("Externe Quelle: multpl.com – aktuelle PE Ratio immer live.")
 if 'show_spxa200r' in locals() and show_spxa200r:
     plot_bpspx_chart()
 
