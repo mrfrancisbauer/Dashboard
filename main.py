@@ -58,7 +58,7 @@ st.sidebar.markdown(f"**Ausgewähltes Intervall:** {resolution_note.get(interval
 with st.sidebar.expander("🔍 Anzeigen"):
     show_indicators = st.checkbox("Indikatoren anzeigen", value=True)
     show_signals = st.checkbox("Buy/Test Signale anzeigen", value=True)
-    show_fib_extensions = st.sidebar.checkbox("Fibonacci Extensions anzeigen", value=True)
+    show_fib_extensions = st.checkbox("Fibonacci Extensions anzeigen", value=True)
 
 # Neu: Auswahlfeld für Trendrichtung
 trend_direction = st.sidebar.radio("Trendrichtung für Fibonacci", options=["Uptrend", "Downtrend"], index=0)
@@ -783,6 +783,9 @@ for lvl, val in fib.items():
         yshift=15
     )
 
+# --- Checkbox für Fibonacci Extensions war hier vorher außerhalb des Expanders ---
+# (Entfernt, da sie jetzt im Expander "🔍 Anzeigen" ist)
+
 fig3.update_layout(
     title=dict(text=f"{ticker} – Interaktiver Chart", x=0.5, xanchor='center', font=dict(size=16, family="Arial", color='#ffffff', weight='bold')),
     xaxis_title=dict(text="Datum", font=dict(color='#ffffff', size=12, family="Arial", weight='bold')),
@@ -870,18 +873,13 @@ with st.expander("📊 Zusätzliche Makro-Charts"):
     show_hyg_vs_spx = st.checkbox("HYG vs SPX anzeigen", value=True)
     show_vix_vs_spx = st.checkbox("VIX vs SPX anzeigen", value=True)
     show_spx_ma = st.checkbox("SPX Monthly MAs anzeigen", value=True)
-    show_spxa200r = st.checkbox("SPXA200R anzeigen", value=True)
+    #show_spxa200r = st.checkbox("SPXA200R anzeigen", value=True)
     show_vix_seasonality = st.checkbox("VIX Saisonalität anzeigen", value=True)
     show_SP500_seasonality = st.checkbox("S&P500 Saisonalität anzeigen", value=True)
     show_sp500_pe_ratio = st.checkbox("S&P500 PE Ratio anzeigen", value=True)
 
     # JNK Detailchart anzeigen
     if show_jnk_detail_chart:
-        import yfinance as yf
-        import matplotlib.pyplot as plt
-        import matplotlib.dates as mdates
-        from ta.momentum import RSIIndicator
-
         start_date = "2023-06-01"
         end_date = "2025-06-27"
 
@@ -920,10 +918,10 @@ with st.expander("📊 Zusätzliche Makro-Charts"):
             st.pyplot(fig)
 
 # Ensure all charts can be shown independently
-if 'show_junk' in locals() and show_jnk_detail_chart:
-    plot_jnk_spx_chart()
-if 'show_hyg_vs_spx' in locals() and show_hyg_vs_spx:
-    plot_hyg_chart()
+#if 'show_junk' in locals() and show_jnk_detail_chart:
+ #   plot_jnk_spx_chart()
+    if 'show_hyg_vs_spx' in locals() and show_hyg_vs_spx:
+        plot_hyg_chart()
     # VIX vs SPX Chart mit RSI
     if show_vix_vs_spx:
         vix = yf.download("^VIX", start=start_date, end=end_date)
@@ -956,53 +954,53 @@ if 'show_hyg_vs_spx' in locals() and show_hyg_vs_spx:
         ax2.legend()
 
         st.pyplot(fig)
-elif 'show_vix_vs_spx' in locals() and show_vix_vs_spx:
-    vix = yf.download("^VIX", start=start_date, end=end_date)
-    spx = yf.download("^GSPC", start=start_date, end=end_date)
+    elif 'show_vix_vs_spx' in locals() and show_vix_vs_spx:
+        vix = yf.download("^VIX", start=start_date, end=end_date)
+        spx = yf.download("^GSPC", start=start_date, end=end_date)
 
-    vix_close = vix["Close"]
-    spx_close = spx["Close"]
+        vix_close = vix["Close"]
+        spx_close = spx["Close"]
 
-    rsi_vix = RSIIndicator(close=vix_close.squeeze(), window=14).rsi()
+        rsi_vix = RSIIndicator(close=vix_close.squeeze(), window=14).rsi()
 
-    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 8), sharex=True)
+        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 8), sharex=True)
 
-    ax1.plot(vix_close, label='VIX', color='black')
-    ax1.set_ylabel("VIX", color='black')
-    ax1.tick_params(axis='y', labelcolor='black')
-    ax1.legend(loc="upper left")
+        ax1.plot(vix_close, label='VIX', color='black')
+        ax1.set_ylabel("VIX", color='black')
+        ax1.tick_params(axis='y', labelcolor='black')
+        ax1.legend(loc="upper left")
 
-    ax1_2 = ax1.twinx()
-    ax1_2.plot(spx_close, label='SPX', color='blue', alpha=0.6)
-    ax1_2.set_ylabel("SPX", color='blue')
-    ax1_2.tick_params(axis='y', labelcolor='blue')
-    ax1_2.legend(loc="upper right")
-    ax1.set_title("VIX vs SPX")
+        ax1_2 = ax1.twinx()
+        ax1_2.plot(spx_close, label='SPX', color='blue', alpha=0.6)
+        ax1_2.set_ylabel("SPX", color='blue')
+        ax1_2.tick_params(axis='y', labelcolor='blue')
+        ax1_2.legend(loc="upper right")
+        ax1.set_title("VIX vs SPX")
 
-    ax2.plot(rsi_vix, label="VIX RSI", color='red')
-    ax2.axhline(70, linestyle='--', color='gray')
-    ax2.axhline(30, linestyle='--', color='gray')
-    ax2.set_ylabel("RSI")
-    ax2.set_title("VIX RSI")
-    ax2.legend()
+        ax2.plot(rsi_vix, label="VIX RSI", color='red')
+        ax2.axhline(70, linestyle='--', color='gray')
+        ax2.axhline(30, linestyle='--', color='gray')
+        ax2.set_ylabel("RSI")
+        ax2.set_title("VIX RSI")
+        ax2.legend()
 
-    st.pyplot(fig)
-if 'show_vix_seasonality' in locals() and show_vix_seasonality:
-    st.markdown("### VIX Saisonalität (20-Jahres-Schnitt)")
-    st.image("images/vix_seasonality.png", use_container_width=True)
-    st.caption("Durchschnittliche saisonale Volatilität basierend auf 20 Jahren")
-if 'show_SP500_seasonality' in locals() and show_SP500_seasonality:
-    st.markdown("### S&P 500 Saisonalität")
-    st.image("images/S&P500seasonality.png", use_container_width=True)
-    st.caption("Durchschnittliche saisonale Volatilität basierend auf 20 Jahren")
-if 'show_spx_ma' in locals() and show_spx_ma:
-    plot_spx_monthly_ma_chart()
-if 'show_sp500_pe_ratio' in locals() and show_sp500_pe_ratio:
-    st.markdown("### S&P 500 PE Ratio")
-    st.markdown("[📈 Zur Live-Grafik auf multpl.com](https://www.multpl.com/s-p-500-pe-ratio)")
-    st.caption("Externe Quelle: multpl.com – aktuelle PE Ratio immer live.")
-if 'show_spxa200r' in locals() and show_spxa200r:
-    plot_bpspx_chart()
+        st.pyplot(fig)
+    if 'show_vix_seasonality' in locals() and show_vix_seasonality:
+        st.markdown("### VIX Saisonalität (20-Jahres-Schnitt)")
+        st.image("images/vix_seasonality.png", use_container_width=True)
+        st.caption("Durchschnittliche saisonale Volatilität basierend auf 20 Jahren")
+    if 'show_SP500_seasonality' in locals() and show_SP500_seasonality:
+        st.markdown("### S&P 500 Saisonalität")
+        st.image("images/S&P500seasonality.png", use_container_width=True)
+        st.caption("Durchschnittliche saisonale Volatilität basierend auf 20 Jahren")
+    if 'show_spx_ma' in locals() and show_spx_ma:
+        plot_spx_monthly_ma_chart()
+    if 'show_sp500_pe_ratio' in locals() and show_sp500_pe_ratio:
+        st.markdown("### S&P 500 PE Ratio")
+        st.markdown("[📈 Zur Live-Grafik auf multpl.com](https://www.multpl.com/s-p-500-pe-ratio)")
+        st.caption("Externe Quelle: multpl.com – aktuelle PE Ratio immer live.")
+    if 'show_spxa200r' in locals() and show_spxa200r:
+        plot_bpspx_chart()
 
 
 # 📊 Sektorrotation
