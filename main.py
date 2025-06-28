@@ -452,23 +452,6 @@ for lvl, val in fib.items():
 for lvl, val in fib.items():
     ax.text(data.index.min(), val, f'Fib {lvl}', color='#666666', fontsize=8, verticalalignment='bottom', horizontalalignment='left')
 
-if show_fib_extensions and 'fig3' in locals():
-    for lvl, val in fib_ext.items():
-        color = '#ff9999' if trend == "up" else '#99ccff'
-        fig3.add_hline(y=val, line=dict(dash='dot', color=color), opacity=0.5)
-        fig3.add_annotation(
-            x=plot_df.index[-1],
-            y=val,
-            text=f"Ext {lvl}: {val:.0f}",
-            showarrow=False,
-            font=dict(size=11, color=color),
-            bgcolor='rgba(255,255,255,0.2)',
-            bordercolor=color,
-            borderwidth=1,
-            xanchor='right',
-            yshift=15
-        )
-
 # Volumenprofil
 for count, edge in zip(hist_vals, bin_edges[:-1]):
     ax.barh(y=edge, width=(count / max_volume) * close_series.max() * 0.1, height=(bin_edges[1] - bin_edges[0]), alpha=0.2, color='gray')
@@ -999,8 +982,8 @@ with st.expander("📊 Zusätzliche Makro-Charts"):
         st.markdown("### S&P 500 PE Ratio")
         st.markdown("[📈 Zur Live-Grafik auf multpl.com](https://www.multpl.com/s-p-500-pe-ratio)")
         st.caption("Externe Quelle: multpl.com – aktuelle PE Ratio immer live.")
-    if 'show_spxa200r' in locals() and show_spxa200r:
-        plot_bpspx_chart()
+   # if 'show_spxa200r' in locals() and show_spxa200r:
+   #    plot_bpspx_chart()
 
 
 # 📊 Sektorrotation
