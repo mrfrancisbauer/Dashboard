@@ -102,6 +102,9 @@ with st.sidebar.expander("📘 Tickerliste (Beispiele)"):
     - AMZN → Amazon
     - AMD → AMD
     - MO.PA → LVMH
+    
+    **Einzelaktien**
+    - GC=F → Gold Future  
 
     **ETFs**
     - SPY → S&P 500 ETF  
@@ -109,6 +112,9 @@ with st.sidebar.expander("📘 Tickerliste (Beispiele)"):
     - IWM → Russell 2000 ETF  
     - DIA → Dow Jones ETF  
     """)
+
+
+
 start_date = st.sidebar.date_input("📅 Startdatum", value=pd.to_datetime("2024-01-01"))
 # Set default end date to tomorrow (today + 1 day), but only as default; if the user selects another date, use that.
 default_end_date = pd.to_datetime("today") + pd.Timedelta(days=1)
@@ -130,6 +136,91 @@ with st.sidebar.expander("ℹ️ Erklärung zur Zonenprominenz"):
 
     **Technischer Hintergrund:** Eine Spitze zählt nur dann als relevant, wenn sie sich um mindestens die gewählte Prominenz **von benachbarten Kurswerten abhebt** (basierend auf `scipy.signal.find_peaks`).
     """)
+
+with st.sidebar.expander("🤖 Automatisches Multimarkt-LSTM-Training"):
+    st.markdown("""
+    Trainiere dein LSTM-Modell **automatisch** mit mehreren Märkten (z. B. S&P 500, Nasdaq, Dow, Russell, AAPL, MSFT, NVDA, TSLA).
+
+    Dadurch wird das Modell robuster und erkennt Muster über verschiedene Indizes und große Aktien hinweg.
+    """)
+
+    if st.button("🔄 Modell mit mehreren Märkten trainieren"):
+        st.info("📥 Lade kombinierte Daten (mehrere Indizes & Aktien)...")
+
+        tickers = ["^GSPC", "^NDX", "^DJI", "^RUT", "AAPL", "MSFT", "NVDA", "TSLA"]
+        frames = []
+
+        for ticker_symbol in tickers:
+            df = yf.download(ticker_symbol, start=start_date, end=end_date, interval="1d", auto_adjust=True)
+            if df.empty or 'Close' not in df.columns:
+                continue
+
+            df['Close_Series'] = df['Close'].squeeze()
+            df['EMA5'] = df['Close_Series'].ewm(span=5, adjust=False).mean()
+            df['MA20'] = df['Close_Series'].rolling(window=20).mean()
+            df['MA50'] = df['Close_Series'].rolling(window=50).mean()
+            df['RSI'] = RSIIndicator(close=df['Close_Series'], window=14).rsi()
+
+            vix_df = yf.download("^VIX", start=start_date, end=end_date, interval="1d", auto_adjust=True)
+            vix_df['VIX_SMA5'] = vix_df['Close'].rolling(window=5).mean()
+            vix_df['VIX_RSI'] = RSIIndicator(close=vix_df['Close'].squeeze(), window=14).rsi()
+            vix_df['VIX_Change'] = vix_df['Close'].pct_change()
+            vix_df['Month'] = vix_df.index.month / 12.0
+            vix_df = vix_df[['Close', 'VIX_SMA5', 'VIX_RSI', 'VIX_Change', 'Month']]
+            vix_df.rename(columns={'Close': 'VIX_Close'}, inplace=True)
+
+            df = df.join(vix_df, how='left')
+            df['RSI_Change'] = df['RSI'].diff()
+            df['Close_MA20_Pct'] = (df['Close_Series'] - df['MA20']) / df['MA20']
+            df['Close_EMA5_Pct'] = (df['Close_Series'] - df['EMA5']) / df['EMA5']
+            df.dropna(inplace=True)
+
+            features_df = df[['Close_Series', 'RSI', 'MA50', 'VIX_Close', 'VIX_SMA5', 'VIX_RSI',
+                              'VIX_Change', 'Month', 'RSI_Change', 'Close_MA20_Pct', 'Close_EMA5_Pct']]
+            frames.append(features_df)
+
+        if not frames:
+            st.error("❌ Keine gültigen Daten gefunden.")
+        else:
+            combined_df = pd.concat(frames, axis=0)
+            combined_df.dropna(inplace=True)
+
+            scaler = MinMaxScaler()
+            scaled_features = scaler.fit_transform(combined_df)
+
+            def create_sequences(data, seq_len=30):
+                X, y = [], []
+                for i in range(len(data) - seq_len):
+                    X.append(data[i:i + seq_len])
+                    y.append(data[i + seq_len, 0])
+                return np.array(X), np.array(y)
+
+            sequence_length = 30
+            X_seq, y_seq = create_sequences(scaled_features, sequence_length)
+            expected_shape = (sequence_length, scaled_features.shape[1])
+
+            model = Sequential()
+            model.add(LSTM(64, activation='relu', input_shape=expected_shape))
+            model.add(Dense(1))
+            model.compile(optimizer='adam', loss='mse', run_eagerly=True)
+
+            checkpoint = ModelCheckpoint("lstm_model.keras", monitor='loss', save_best_only=True, verbose=0)
+            import tensorflow as tf
+            early_stop = tf.keras.callbacks.EarlyStopping(monitor='loss', patience=5, restore_best_weights=True)
+
+            epochs = 50
+            batch_size = 16
+            progress_bar = st.progress(0)
+            status_text = st.empty()
+
+            for epoch in range(epochs):
+                model.fit(X_seq, y_seq, epochs=1, batch_size=batch_size, verbose=0, callbacks=[checkpoint, early_stop])
+                progress = (epoch + 1) / epochs
+                progress_bar.progress(progress)
+                status_text.text(f"Training... Epoche {epoch + 1}/{epochs}")
+
+            progress_bar.progress(1.0)
+            status_text.text("✅ Multimarkt-Training abgeschlossen.")
 
 
 
@@ -429,7 +520,7 @@ for i, zone in enumerate(confluence_zones):
         ha="left",
         va='center',
         bbox=dict(facecolor='white', alpha=0.8, edgecolor='gray'),
-        fontsize=8,
+        fontsize=12,
         arrowprops=None
     )
     # --- Kursziel unterhalb der aktuellen Zone anzeigen ---
@@ -445,7 +536,7 @@ for i, zone in enumerate(confluence_zones):
         f"Zielbereich: {kursziel:.0f}" if isinstance(kursziel, (int, float)) else f"Zielbereich: {float(kursziel.iloc[-1]):.0f}",
         verticalalignment='center',
         bbox=dict(facecolor='gray', edgecolor='black', boxstyle='round,pad=0.4'),
-        fontsize=8,
+        fontsize=12,
         color='white'
     )
 
@@ -459,7 +550,7 @@ custom_lines = [
 for lvl, val in fib.items():
     ax.axhline(val, linestyle='--', alpha=0.7, label=f'Fib {lvl} → {val:.0f}', color='#cccccc')
 for lvl, val in fib.items():
-    ax.text(data.index.min(), val, f'Fib {lvl}', color='#666666', fontsize=8, verticalalignment='bottom', horizontalalignment='left')
+    ax.text(data.index.min(), val, f'Fib {lvl}', color='#666666', fontsize=10, verticalalignment='bottom', horizontalalignment='left')
 
 # Volumenprofil
 for count, edge in zip(hist_vals, bin_edges[:-1]):
@@ -718,7 +809,7 @@ fig3.add_trace(go.Candlestick(
 ))
 # --- Confluence Zones im Plotly-Chart ---
 for zone in confluence_zones:
-    color = {3: 'darkgreen', 2: 'orange', 1: 'gray'}.get(zone['score'], 'gray')
+    color = {3: 'darkgreen', 2: 'blue', 1: 'gray'}.get(zone['score'], 'gray')
     fig3.add_hline(
         y=zone['level'],
         line=dict(dash='dash', color=color, width=2),
@@ -733,7 +824,7 @@ for zone in confluence_zones:
         y=zone['level'],
         text=label,
         showarrow=False,
-        font=dict(size=13, color=color),
+        font=dict(size=16, color=color),
         bgcolor='rgba(255,255,255,0.7)',
         bordercolor=color,
         borderwidth=1,
@@ -768,7 +859,7 @@ for lvl, val in fib.items():
         y=val,
         text=f"Fib {lvl}: {val:.0f}",
         showarrow=False,
-        font=dict(size=11, color='#cccccc'),
+        font=dict(size=13, color='#cccccc'),
         bgcolor='rgba(204, 204, 204, 0.2)',
         bordercolor='#999999',
         borderwidth=1,
@@ -781,8 +872,8 @@ for lvl, val in fib.items():
 
 fig3.update_layout(
     title=dict(text=f"{ticker} – Interaktiver Chart", x=0.5, xanchor='center', font=dict(size=16, family="Arial", color='#ffffff', weight='bold')),
-    xaxis_title=dict(text="Datum", font=dict(color='#ffffff', size=12, family="Arial", weight='bold')),
-    yaxis_title=dict(text="Preis", font=dict(color='#ffffff', size=12, family="Arial", weight='bold')),
+    xaxis_title=dict(text="Datum", font=dict(color='#ffffff', size=14, family="Arial", weight='bold')),
+    yaxis_title=dict(text="Preis", font=dict(color='#ffffff', size=14, family="Arial", weight='bold')),
     plot_bgcolor='#1e1e1e',
     paper_bgcolor='#1e1e1e',
     font=dict(color='#ffffff'),
