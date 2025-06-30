@@ -11,6 +11,13 @@ from ta.momentum import RSIIndicator
 from ta.volatility import BollingerBands
 from scipy.signal import find_peaks
 import plotly.graph_objects as go
+# --- LSTM Forecast Integration ---
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import LSTM, Dense
+from sklearn.preprocessing import MinMaxScaler
+from tensorflow.keras.models import load_model
+from tensorflow.keras.callbacks import ModelCheckpoint
+import os
 # --- Inserted function: plot_spx_monthly_ma_chart() ---
 def plot_spx_monthly_ma_chart():
 
@@ -146,6 +153,7 @@ def load_data(ticker, start, end, interval):
     df['RSI'] = RSIIndicator(close=df['Close_Series'], window=14).rsi()
 
     df['EMA5'] = df['Close'].ewm(span=5, adjust=False).mean()
+    df['EMA9'] = df['Close'].ewm(span=9, adjust=False).mean()
     df['EMA14'] = df['Close'].ewm(span=14, adjust=False).mean()
     df['EMA69'] = df['Close'].ewm(span=69, adjust=False).mean()
     df['EMA_5W'] = df['Close'].ewm(span=5 * 5, adjust=False).mean()  # 5 Wochen EMA auf Tagesbasis
@@ -262,6 +270,7 @@ ax.plot(data['MA100'], label='MA100', linestyle='--', color='brown')
 ax.plot(data['MA200'], label='MA200', linestyle='--', color='#ff0000')
 
 ax.plot(data['EMA5'], label='EMA5', linestyle='--', color='#cc00cc')
+ax.plot(data['EMA9'], label='EMA9', linestyle='--', color='#ffff00')
 ax.plot(data['EMA14'], label='EMA14', linestyle='--', color='#00cc00')
 ax.plot(data['EMA69'], label='EMA69', linestyle='--', color='#9966ff')
 ax.plot(data['MA20'], label='MA20', linestyle='--', color='red')
@@ -654,6 +663,7 @@ if show_indicators:
     fig3.add_trace(go.Scatter(x=plot_df.index, y=plot_df['MA50'], name='MA50', line=dict(dash='dot', color='orange')))
     fig3.add_trace(go.Scatter(x=plot_df.index, y=plot_df['MA200'], name='MA200', line=dict(dash='dot', color='orange')))
     fig3.add_trace(go.Scatter(x=plot_df.index, y=plot_df['EMA5'], name='EMA5', line=dict(dash='dot', color='blueviolet')))
+    fig3.add_trace(go.Scatter(x=plot_df.index, y=plot_df['EMA9'], name='EMA9', line=dict(dash='dot', color='yellow')))
     fig3.add_trace(go.Scatter(x=plot_df.index, y=plot_df['EMA14'], name='EMA14', line=dict(dash='dot', color='green')))
     fig3.add_trace(go.Scatter(x=plot_df.index, y=plot_df['EMA69'], name='EMA69', line=dict(dash='dot', color='magenta')))
     fig3.add_trace(go.Scatter(x=plot_df.index, y=plot_df['EMA_5W'], name='Weekly EMA(5)', line=dict(dash='dot', color='gray')))
@@ -779,7 +789,147 @@ fig3.update_layout(
     xaxis=dict(gridcolor='#444444', rangeslider_visible=False),
     yaxis=dict(gridcolor='#444444', autorange=True)
 )
+
+# --- Verbesserter LSTM Forecast mit Unsicherheitsband und Reversion ---
+st.subheader("🔮 Verbesserter LSTM Forecast mit Unsicherheitsband")
+show_lstm = st.checkbox("LSTM Forecast anzeigen", value=False)
+
+if show_lstm:
+    st.info("Der Forecast wird mit Unsicherheitsband (±1σ) und Reversionslogik berechnet. Basierend auf Closing, EMA5 und MA20 sowie VIX.")
+
+    # VIX laden
+    vix_df = yf.download("^VIX", start=start_date, end=end_date)
+    vix_df['VIX_SMA5'] = vix_df['Close'].rolling(window=5).mean()
+    vix_df['VIX_RSI'] = RSIIndicator(close=vix_df['Close'].squeeze(), window=14).rsi()
+    vix_df['VIX_Change'] = vix_df['Close'].pct_change()
+    vix_df['Month'] = vix_df.index.month / 12.0
+
+    vix_df = vix_df[['Close', 'VIX_SMA5', 'VIX_RSI', 'VIX_Change', 'Month']]
+    vix_df.rename(columns={'Close': 'VIX_Close'}, inplace=True)
+
+    features_df = data.join(vix_df, how='left')
+    features_df = features_df[['Close_Series', 'RSI', 'MA50', 'MA20', 'EMA5',
+                               'VIX_Close', 'VIX_SMA5', 'VIX_RSI', 'VIX_Change', 'Month']]
+    features_df['RSI_Change'] = features_df['RSI'].diff()
+    features_df['Close_MA20_Pct'] = (features_df['Close_Series'] - features_df['MA20']) / features_df['MA20']
+    features_df['Close_EMA5_Pct'] = (features_df['Close_Series'] - features_df['EMA5']) / features_df['EMA5']
+    features_df.dropna(inplace=True)
+
+    features_df = features_df[['Close_Series', 'RSI', 'MA50', 'VIX_Close', 'VIX_SMA5', 'VIX_RSI',
+                               'VIX_Change', 'Month', 'RSI_Change', 'Close_MA20_Pct', 'Close_EMA5_Pct']]
+
+    scaler = MinMaxScaler()
+    scaled_features = scaler.fit_transform(features_df)
+
+    def create_sequences(data, seq_len=30):
+        X, y = [], []
+        for i in range(len(data) - seq_len):
+            X.append(data[i:i + seq_len])
+            y.append(data[i + seq_len, 0])
+        return np.array(X), np.array(y)
+
+    sequence_length = 30
+    X_seq, y_seq = create_sequences(scaled_features, sequence_length)
+
+    import tensorflow as tf
+    tf.keras.backend.clear_session()
+
+    model_path = "lstm_model.keras"
+    expected_shape = (sequence_length, scaled_features.shape[1])
+
+    if os.path.exists(model_path):
+        st.success("✅ Modell gefunden – lade Modell.")
+        model = load_model(model_path, compile=False)
+        model_shape = model.input_shape[1:]
+        if model_shape != expected_shape:
+            st.warning(f"⚠️ Shape mismatch! Lösche altes Modell. Expected: {expected_shape}, but was: {model_shape}.")
+            os.remove(model_path)
+            model = None
+        else:
+            model.compile(optimizer='adam', loss='mse', run_eagerly=True)
+    else:
+        model = None
+
+    if model is None:
+        st.warning("⚠️ Kein Modell gefunden oder neu erstellt wegen Shape-Wechsel.")
+        model = Sequential()
+        model.add(LSTM(64, activation='relu', input_shape=expected_shape))
+        model.add(Dense(1))
+        model.compile(optimizer='adam', loss='mse', run_eagerly=True)
+
+    checkpoint = ModelCheckpoint(model_path, monitor='loss', save_best_only=True, verbose=0)
+    early_stop = tf.keras.callbacks.EarlyStopping(monitor='loss', patience=5, restore_best_weights=True)
+
+    epochs = 50
+    batch_size = 16
+
+    progress_bar = st.progress(0)
+    status_text = st.empty()
+
+    for epoch in range(epochs):
+        model.fit(X_seq, y_seq, epochs=1, batch_size=batch_size, verbose=0, callbacks=[checkpoint, early_stop])
+        progress = (epoch + 1) / epochs
+        progress_bar.progress(progress)
+        status_text.text(f"Training... Epoche {epoch + 1}/{epochs}")
+
+    progress_bar.progress(1.0)
+    status_text.text("✅ Training abgeschlossen.")
+
+    # Forecast-Loop
+    last_seq = scaled_features[-sequence_length:].copy()
+    forecast_scaled = []
+    current_seq = last_seq
+
+    for _ in range(5):
+        pred_scaled = model.predict(current_seq.reshape(1, sequence_length, X_seq.shape[-1]), verbose=0)[0, 0]
+        # Reversion Logic
+        pred_scaled = current_seq[-1][0] + 0.8 * (pred_scaled - current_seq[-1][0])
+        new_row = current_seq[-1].copy()
+        new_row[0] = pred_scaled
+        current_seq = np.vstack((current_seq[1:], new_row))
+        forecast_scaled.append(pred_scaled)
+
+    # Dummy für Inverse Transform
+    dummy_zeros = np.zeros((len(forecast_scaled), scaled_features.shape[1]))
+    dummy_zeros[:, 0] = forecast_scaled
+    forecast_close = scaler.inverse_transform(dummy_zeros)[:, 0]
+
+    residuals = y_seq - model.predict(X_seq, verbose=0).flatten()
+    residual_std = np.std(residuals)
+
+    band_upper = forecast_close + residual_std
+    band_lower = forecast_close - residual_std
+
+    forecast_dates = pd.date_range(start=data.index[-1] + pd.Timedelta(days=1), periods=5, freq='B')
+    forecast_df = pd.DataFrame({'Date': forecast_dates, 'Forecast': forecast_close,
+                                'Upper': band_upper, 'Lower': band_lower})
+
+    st.subheader("🗒️ Forecast-Tabelle (LSTM)")
+    st.dataframe(forecast_df.style.format({"Forecast": "{:.2f}", "Upper": "{:.2f}", "Lower": "{:.2f}"}))
+
+    # Traces
+    forecast_trace = go.Scatter(x=forecast_df['Date'], y=forecast_df['Forecast'], mode='lines+markers',
+                                name='LSTM Forecast', line=dict(color='deepskyblue', width=3))
+
+    upper_trace = go.Scatter(x=forecast_df['Date'], y=forecast_df['Upper'], mode='lines',
+                             name='Upper Band', line=dict(color='lightblue', dash='dot'), showlegend=False)
+
+    lower_trace = go.Scatter(x=forecast_df['Date'], y=forecast_df['Lower'], mode='lines',
+                             name='Lower Band', line=dict(color='lightblue', dash='dot'), fill='tonexty',
+                             fillcolor='rgba(30, 144, 255, 0.2)', showlegend=False)
+
+    connection_trace = go.Scatter(x=[data.index[-1], forecast_df['Date'].iloc[0]],
+                                  y=[data['Close_Series'].iloc[-1], forecast_df['Forecast'].iloc[0]],
+                                  mode='lines', line=dict(color='deepskyblue', dash='dot'), showlegend=False)
+
+    fig3.add_trace(connection_trace)
+    fig3.add_trace(upper_trace)
+    fig3.add_trace(lower_trace)
+    fig3.add_trace(forecast_trace)
+
 st.plotly_chart(fig3, use_container_width=True)
+
+
 # Legende als Expander statt im Chart
 with st.expander("Legende"):
     st.markdown("""
