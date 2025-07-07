@@ -18,6 +18,45 @@ from sklearn.preprocessing import MinMaxScaler
 from tensorflow.keras.models import load_model
 from tensorflow.keras.callbacks import ModelCheckpoint
 import os
+
+# ==== NEUE FUNKTIONEN: Exakter Haupt-Channel & RSI-Trendlinie ====
+def add_precise_channel(fig, series, start_idx=None, end_idx=None, color="blue", name_prefix="Main Channel"):
+    sub_series = series
+    if start_idx and end_idx:
+        sub_series = series[start_idx:end_idx]
+    upper_quantile = sub_series.quantile(0.95)
+    lower_quantile = sub_series.quantile(0.05)
+    upper_idx = sub_series[sub_series >= upper_quantile].index
+    lower_idx = sub_series[sub_series <= lower_quantile].index
+    if len(upper_idx) > 1 and len(lower_idx) > 1:
+        import matplotlib.dates as mdates
+        from scipy.stats import linregress
+        x_upper = mdates.date2num(upper_idx.to_pydatetime())
+        y_upper = sub_series[upper_idx]
+        slope_up, intercept_up, _, _, _ = linregress(x_upper, y_upper)
+        x_lower = mdates.date2num(lower_idx.to_pydatetime())
+        y_lower = sub_series[lower_idx]
+        slope_lo, intercept_lo, _, _, _ = linregress(x_lower, y_lower)
+        x_plot = mdates.date2num(sub_series.index.to_pydatetime())
+        upper_line = slope_up * x_plot + intercept_up
+        lower_line = slope_lo * x_plot + intercept_lo
+        mid_line = (upper_line + lower_line) / 2
+        fig.add_trace(go.Scatter(x=sub_series.index, y=upper_line,
+                                 mode='lines', line=dict(color=color, width=2),
+                                 name=f"{name_prefix} Top"))
+        fig.add_trace(go.Scatter(x=sub_series.index, y=lower_line,
+                                 mode='lines', line=dict(color=color, width=2),
+                                 name=f"{name_prefix} Bottom"))
+        fig.add_trace(go.Scatter(x=sub_series.index, y=mid_line,
+                                 mode='lines', line=dict(color=color, dash='dot', width=1),
+                                 name=f"{name_prefix} Mid"))
+        fig.add_shape(type="rect",
+                      x0=sub_series.index[0], x1=sub_series.index[-1],
+                      y0=min(lower_line), y1=max(upper_line),
+                      fillcolor="rgba(0, 0, 255, 0.05)", line=dict(width=0),
+                      layer="below")
+
+
 # --- Inserted function: plot_spx_monthly_ma_chart() ---
 def plot_spx_monthly_ma_chart():
 
@@ -60,12 +99,16 @@ resolution_note = {
 }
 st.sidebar.markdown(f"**Ausgewähltes Intervall:** {resolution_note.get(interval, '')}")
 
+vereinfachte_trading = st.sidebar.checkbox("🎯 Vereinfachte Trading-Ansicht", value=False)
+
+# ==== Sidebar-Checkboxen für neue Overlays ====
+show_precise_channel = st.sidebar.checkbox("🎯 Exakten Haupt-Channel anzeigen", value=True, disabled=vereinfachte_trading)
 
 # Sidebar: Anzeigeoptionen für Indikatoren und Signale
 with st.sidebar.expander("🔍 Anzeigen"):
-    show_indicators = st.checkbox("Indikatoren anzeigen", value=True)
-    show_signals = st.checkbox("Buy/Test Signale anzeigen", value=True)
-    show_fib_extensions = st.checkbox("Fibonacci Extensions anzeigen", value=True)
+    show_indicators = st.checkbox("Indikatoren anzeigen", value=True, disabled=vereinfachte_trading)
+    show_signals = st.checkbox("Buy/Test Signale anzeigen", value=True, disabled=vereinfachte_trading)
+    show_fib_extensions = st.checkbox("Fibonacci Extensions anzeigen", value=True, disabled=vereinfachte_trading)
 
 # Neu: Auswahlfeld für Trendrichtung
 trend_direction = st.sidebar.radio("Trendrichtung für Fibonacci", options=["Uptrend", "Downtrend"], index=0)
@@ -746,35 +789,47 @@ plot_df['Test Signal'] = np.where(plot_df.index.isin(test_zone.index), plot_df['
 buy_signals = plot_df['Buy Signal'].dropna()
 test_signals = plot_df['Test Signal'].dropna()
 
-fig3 = go.Figure()
+from plotly.subplots import make_subplots
+fig3 = make_subplots(
+    rows=2, cols=1,
+    shared_xaxes=True,
+    vertical_spacing=0.07,
+    row_heights=[0.75, 0.25],
+    subplot_titles=(f"{ticker} – Preis (Candlestick, MA50, MA200, Zonen, Fibonacci)", "RSI (14)")
+)
 fig3.update_layout(height=1200)
 
-# Bedingte Anzeige der Indikatoren
+# Bedingte Anzeige der Indikatoren (alle in row=1, col=1)
 if show_indicators:
-    fig3.add_trace(go.Scatter(x=plot_df.index, y=plot_df['MA50'], name='MA50', line=dict(dash='dot', color='orange')))
-    fig3.add_trace(go.Scatter(x=plot_df.index, y=plot_df['MA200'], name='MA200', line=dict(dash='dot', color='orange')))
-    fig3.add_trace(go.Scatter(x=plot_df.index, y=plot_df['EMA5'], name='EMA5', line=dict(dash='dot', color='blueviolet')))
-    fig3.add_trace(go.Scatter(x=plot_df.index, y=plot_df['EMA9'], name='EMA9', line=dict(dash='dot', color='yellow')))
-    fig3.add_trace(go.Scatter(x=plot_df.index, y=plot_df['EMA14'], name='EMA14', line=dict(dash='dot', color='green')))
-    fig3.add_trace(go.Scatter(x=plot_df.index, y=plot_df['EMA69'], name='EMA69', line=dict(dash='dot', color='magenta')))
-    fig3.add_trace(go.Scatter(x=plot_df.index, y=plot_df['EMA_5W'], name='Weekly EMA(5)', line=dict(dash='dot', color='gray')))
-    fig3.add_trace(go.Scatter(x=plot_df.index, y=plot_df['EMA_5Y'], name='Yearly EMA(5)', line=dict(dash='dash', color='gray')))
-    fig3.add_trace(go.Scatter(x=plot_df.index, y=plot_df['MA20'], name='MA20', line=dict(dash='dot', color='red')))
-    fig3.add_trace(go.Scatter(x=plot_df.index, y=plot_df['MA100'], name='MA100', line=dict(dash='dot', color='brown')))
-    fig3.add_trace(go.Scatter(x=plot_df.index, y=plot_df['BB_upper'], name='BB Upper', line=dict(dash='dot', color='purple'), opacity=0.6))
-    fig3.add_trace(go.Scatter(x=plot_df.index, y=plot_df['BB_lower'], name='BB Lower', line=dict(dash='dot', color='purple'), opacity=0.6))
-    fig3.add_trace(go.Scatter(x=plot_df.index, y=plot_df['BB_mid'], name='BB Mid', line=dict(dash='dot', color='violet'), opacity=0.4))
+    fig3.add_trace(go.Scatter(x=plot_df.index, y=plot_df['MA50'], name='MA50', line=dict(dash='dot', color='orange')), row=1, col=1)
+    fig3.add_trace(go.Scatter(x=plot_df.index, y=plot_df['MA200'], name='MA200', line=dict(dash='dot', color='orange')), row=1, col=1)
+    fig3.add_trace(go.Scatter(x=plot_df.index, y=plot_df['EMA5'], name='EMA5', line=dict(dash='dot', color='blueviolet')), row=1, col=1)
+    fig3.add_trace(go.Scatter(x=plot_df.index, y=plot_df['EMA9'], name='EMA9', line=dict(dash='dot', color='yellow')), row=1, col=1)
+    fig3.add_trace(go.Scatter(x=plot_df.index, y=plot_df['EMA14'], name='EMA14', line=dict(dash='dot', color='green')), row=1, col=1)
+    fig3.add_trace(go.Scatter(x=plot_df.index, y=plot_df['EMA69'], name='EMA69', line=dict(dash='dot', color='magenta')), row=1, col=1)
+    fig3.add_trace(go.Scatter(x=plot_df.index, y=plot_df['EMA_5W'], name='Weekly EMA(5)', line=dict(dash='dot', color='gray')), row=1, col=1)
+    fig3.add_trace(go.Scatter(x=plot_df.index, y=plot_df['EMA_5Y'], name='Yearly EMA(5)', line=dict(dash='dash', color='gray')), row=1, col=1)
+    fig3.add_trace(go.Scatter(x=plot_df.index, y=plot_df['MA20'], name='MA20', line=dict(dash='dot', color='red')), row=1, col=1)
+    fig3.add_trace(go.Scatter(x=plot_df.index, y=plot_df['MA100'], name='MA100', line=dict(dash='dot', color='brown')), row=1, col=1)
+    fig3.add_trace(go.Scatter(x=plot_df.index, y=plot_df['BB_upper'], name='BB Upper', line=dict(dash='dot', color='purple'), opacity=0.6), row=1, col=1)
+    fig3.add_trace(go.Scatter(x=plot_df.index, y=plot_df['BB_lower'], name='BB Lower', line=dict(dash='dot', color='purple'), opacity=0.6), row=1, col=1)
+    fig3.add_trace(go.Scatter(x=plot_df.index, y=plot_df['BB_mid'], name='BB Mid', line=dict(dash='dot', color='violet'), opacity=0.4), row=1, col=1)
 
-# Bedingte Anzeige der Buy/Test Signale
+# Bedingte Anzeige der Buy/Test Signale (row=1, col=1)
 if show_signals:
     if not buy_signals.empty:
         fig3.add_trace(go.Scatter(
             x=buy_signals.index, y=buy_signals, mode='markers', name='Buy Signal',
-            marker=dict(symbol='circle', size=10, color='green')))
+            marker=dict(symbol='circle', size=10, color='green')), row=1, col=1)
     if not test_signals.empty:
         fig3.add_trace(go.Scatter(
             x=test_signals.index, y=test_signals, mode='markers', name='Test Signal',
-            marker=dict(symbol='x', size=10, color='red')))
+            marker=dict(symbol='x', size=10, color='red')), row=1, col=1)
+
+# ==== Neue Overlays: Exakter Haupt-Channel & RSI-Trendlinie (row=1, col=1) ====
+if show_precise_channel:
+    add_precise_channel(fig3, close_series, color="blue", name_prefix="Precise Channel")
+
 # Sidebar-Expander für EMA(5)-Kontext
 with st.sidebar.expander("EMA(5) – Kontext"):
     st.markdown("""
@@ -795,8 +850,7 @@ if isinstance(plot_df.columns, pd.MultiIndex):
 
 plot_df_reset = plot_df.reset_index().rename(columns={plot_df.index.name or 'index': 'Date'})
 
-# Candlestick-Plot (x-Achse als 'Date' aus reset_index, damit Plotly korrekt darstellt)
-#plot_df_reset = plot_df.reset_index()
+# Candlestick-Plot in row=1, col=1
 fig3.add_trace(go.Candlestick(
     x=plot_df_reset['Date'],
     open=plot_df_reset['Open'],
@@ -806,80 +860,480 @@ fig3.add_trace(go.Candlestick(
     increasing_line_color='lime',
     decreasing_line_color='red',
     name='Candlestick'
-))
-# --- Confluence Zones im Plotly-Chart ---
+), row=1, col=1)
+
+# --- TradingView-Style Layout & Zonen/Annotationen ---
+from scipy.stats import linregress
+import matplotlib.dates as mdates
+
+def add_wedge_overlay(fig, series, window=60, name_prefix="Wedge"):
+    sub_series = series[-window:]
+    upper_idx = sub_series[sub_series >= sub_series.quantile(0.9)].index
+    lower_idx = sub_series[sub_series <= sub_series.quantile(0.1)].index
+
+    if len(upper_idx) > 1 and len(lower_idx) > 1:
+        x_upper = mdates.date2num(upper_idx.to_pydatetime())
+        y_upper = sub_series[upper_idx]
+        slope_up, intercept_up, _, _, _ = linregress(x_upper, y_upper)
+
+        x_lower = mdates.date2num(lower_idx.to_pydatetime())
+        y_lower = sub_series[lower_idx]
+        slope_lo, intercept_lo, _, _, _ = linregress(x_lower, y_lower)
+
+        x_plot = mdates.date2num(sub_series.index.to_pydatetime())
+        upper_line = slope_up * x_plot + intercept_up
+        lower_line = slope_lo * x_plot + intercept_lo
+
+        fig.add_trace(go.Scatter(x=sub_series.index, y=upper_line,
+                                 mode='lines', line=dict(color='yellow', width=2),
+                                 name=f"{name_prefix} Top"))
+        fig.add_trace(go.Scatter(x=sub_series.index, y=lower_line,
+                                 mode='lines', line=dict(color='yellow', width=2),
+                                 name=f"{name_prefix} Bottom"))
+        fig.add_shape(type="rect",
+                      x0=sub_series.index[0], x1=sub_series.index[-1],
+                      y0=min(lower_line), y1=max(upper_line),
+                      fillcolor="rgba(255, 255, 0, 0.05)", line=dict(width=0),
+                      layer="below")
+
+def add_broadening_overlay(fig, series, window=80, name_prefix="Broadening"):
+    sub_series = series[-window:]
+    upper_idx = sub_series[sub_series >= sub_series.quantile(0.9)].index
+    lower_idx = sub_series[sub_series <= sub_series.quantile(0.1)].index
+
+    if len(upper_idx) > 1 and len(lower_idx) > 1:
+        x_upper = mdates.date2num(upper_idx.to_pydatetime())
+        y_upper = sub_series[upper_idx]
+        slope_up, intercept_up, _, _, _ = linregress(x_upper, y_upper)
+
+        x_lower = mdates.date2num(lower_idx.to_pydatetime())
+        y_lower = sub_series[lower_idx]
+        slope_lo, intercept_lo, _, _, _ = linregress(x_lower, y_lower)
+
+        if slope_up - slope_lo > 0.00001:
+            x_plot = mdates.date2num(sub_series.index.to_pydatetime())
+            upper_line = slope_up * x_plot + intercept_up
+            lower_line = slope_lo * x_plot + intercept_lo
+
+            fig.add_trace(go.Scatter(x=sub_series.index, y=upper_line,
+                                     mode='lines', line=dict(color='cyan', width=2),
+                                     name=f"{name_prefix} Top"))
+            fig.add_trace(go.Scatter(x=sub_series.index, y=lower_line,
+                                     mode='lines', line=dict(color='cyan', width=2),
+                                     name=f"{name_prefix} Bottom"))
+            fig.add_shape(type="rect",
+                          x0=sub_series.index[0], x1=sub_series.index[-1],
+                          y0=min(lower_line), y1=max(upper_line),
+                          fillcolor="rgba(0, 255, 255, 0.05)", line=dict(width=0),
+                          layer="below")
+
+def add_flag_channel(fig, series, window=50, name_prefix="Flag"):
+    sub_series = series[-window:]
+    mid = sub_series.median()
+    offset = sub_series.std() * 0.5
+
+    x_vals = np.arange(len(sub_series))
+    upper_line = np.full_like(x_vals, mid + offset, dtype=np.float64)
+    lower_line = np.full_like(x_vals, mid - offset, dtype=np.float64)
+
+    fig.add_trace(go.Scatter(x=sub_series.index, y=upper_line,
+                             mode='lines', line=dict(color='magenta', dash='dash', width=2),
+                             name=f"{name_prefix} Top"))
+    fig.add_trace(go.Scatter(x=sub_series.index, y=lower_line,
+                             mode='lines', line=dict(color='magenta', dash='dash', width=2),
+                             name=f"{name_prefix} Bottom"))
+    fig.add_shape(type="rect",
+                  x0=sub_series.index[0], x1=sub_series.index[-1],
+                  y0=lower_line[0], y1=upper_line[0],
+                  fillcolor="rgba(255, 0, 255, 0.05)", line=dict(width=0),
+                  layer="below")
+
+def add_bb_breakouts(fig, df, name_prefix="BB Breakout"):
+    if "BB_upper" in df.columns and "BB_lower" in df.columns:
+        breakouts_above = df[df["Close_Series"] > df["BB_upper"]]
+        breakouts_below = df[df["Close_Series"] < df["BB_lower"]]
+
+        if not breakouts_above.empty:
+            fig.add_trace(go.Scatter(x=breakouts_above.index, y=breakouts_above["Close_Series"],
+                                     mode='markers', marker=dict(color='lime', size=8, symbol='triangle-up'),
+                                     name=f"{name_prefix} Above"))
+        if not breakouts_below.empty:
+            fig.add_trace(go.Scatter(x=breakouts_below.index, y=breakouts_below["Close_Series"],
+                                     mode='markers', marker=dict(color='red', size=8, symbol='triangle-down'),
+                                     name=f"{name_prefix} Below"))
+# Hintergrund & Grid anpassen (TradingView-Style) für beide Subplots
+fig3.update_layout(
+    plot_bgcolor='#131722',
+    paper_bgcolor='#131722',
+    font=dict(color='#dedede'),
+    hovermode="x unified",
+    title=dict(
+        text=f"{ticker} – Interaktiver Chart",
+        x=0.5, xanchor='center',
+        font=dict(size=16, color='#ffffff')
+    ),
+    height=1200
+)
+fig3.update_xaxes(
+    gridcolor='#2a2e39',
+    showline=True, linewidth=1, linecolor='#666666',
+    showspikes=True, spikecolor="white", spikethickness=1, spikedash='dot',
+    rangeslider_visible=False,
+    row=1, col=1
+)
+fig3.update_xaxes(
+    gridcolor='#2a2e39',
+    showline=True, linewidth=1, linecolor='#666666',
+    showspikes=True, spikecolor="white", spikethickness=1, spikedash='dot',
+    rangeslider_visible=False,
+    row=2, col=1
+)
+fig3.update_yaxes(
+    gridcolor='#2a2e39',
+    showline=True, linewidth=1, linecolor='#666666',
+    showspikes=True, spikecolor="white", spikethickness=1, spikedash='dot',
+    title_text="Preis",
+    row=1, col=1
+)
+fig3.update_yaxes(
+    gridcolor='#2a2e39',
+    showline=True, linewidth=1, linecolor='#666666',
+    title_text="RSI",
+    range=[0, 100],
+    row=2, col=1
+)
+
+# Confluence-Zonen als Bänder (row=1, col=1)
 for zone in confluence_zones:
-    color = {3: 'darkgreen', 2: 'blue', 1: 'gray'}.get(zone['score'], 'gray')
-    fig3.add_hline(
-        y=zone['level'],
-        line=dict(dash='dash', color=color, width=2),
-        opacity=0.9
+    band_color = "rgba(0, 255, 0, 0.07)" if zone['score'] == 3 else \
+                 "rgba(255, 165, 0, 0.07)" if zone['score'] == 2 else \
+                 "rgba(128, 128, 128, 0.05)"
+
+    fig3.add_shape(
+        type="rect",
+        x0=plot_df.index[0],
+        x1=plot_df.index[-1],
+        y0=zone['low'],
+        y1=zone['high'],
+        fillcolor=band_color,
+        line=dict(width=0),
+        layer='below',
+        row=1, col=1
     )
-    # Compose annotation text with score and price range
-    label = f"Confluence Zone: {zone['score']}/3\n{zone['low']:.0f}–{zone['high']:.0f}"
-    # Place annotation clearly outside the right of candles
-    x_pos = plot_df.index[-1] + pd.Timedelta(days=30)
     fig3.add_annotation(
-        x=x_pos,
+        x=plot_df.index[-1],
         y=zone['level'],
-        text=label,
+        text=f"{zone['score']}/3",
         showarrow=False,
-        font=dict(size=16, color=color),
-        bgcolor='rgba(255,255,255,0.7)',
-        bordercolor=color,
+        font=dict(size=10, color='white'),
+        bgcolor='rgba(0,0,0,0.6)',
+        bordercolor='gray',
         borderwidth=1,
-        yshift=0,
-        xanchor='left'
+        xanchor='left',
+        row=1, col=1
     )
-if show_fib_extensions:
+
+# ==== RSI Subplot in row=2, col=1 ====
+rsi_series = data['RSI'].dropna()
+fig3.add_trace(
+    go.Scatter(x=rsi_series.index, y=rsi_series, name='RSI (14)', line=dict(color='deepskyblue', width=2)),
+    row=2, col=1
+)
+fig3.add_hline(y=float(70), line=dict(color='gray', dash='dash'), row=2, col=1)
+fig3.add_hline(y=float(30), line=dict(color='gray', dash='dash'), row=2, col=1)
+
+# --- Chartmuster: Channel Overlay (TradingView-Style) ---
+# Diese Overlays werden in der vereinfachten Ansicht komplett deaktiviert
+if not vereinfachte_trading:
+    show_channels = st.sidebar.checkbox("📐 Channel Overlay anzeigen", value=False)
+    show_wedge = st.sidebar.checkbox("📐 Wedge Overlay", value=False)
+    show_broadening = st.sidebar.checkbox("📈 Broadening Overlay", value=False)
+    show_flag = st.sidebar.checkbox("🏁 Flag/Trendkanal Overlay", value=False)
+    show_bb_breakouts = st.sidebar.checkbox("💥 BB Breakouts", value=False)
+else:
+    show_channels = False
+    show_wedge = False
+    show_broadening = False
+    show_flag = False
+    show_bb_breakouts = False
+
+if vereinfachte_trading:
+    # Vereinfachte Trading-Ansicht: RSI-Subplot direkt in den Hauptchart integrieren
+    from plotly.subplots import make_subplots
+    fig3 = make_subplots(
+        rows=2, cols=1,
+        shared_xaxes=True,
+        vertical_spacing=0.07,
+        row_heights=[0.75, 0.25],
+        subplot_titles=(f"{ticker} – Preis (Candlestick, MA50, MA200, Zonen, Fibonacci)", "RSI (14)")
+    )
+    fig3.update_layout(height=900)
+    # Candlestick
+    fig3.add_trace(go.Candlestick(
+        x=plot_df_reset['Date'],
+        open=plot_df_reset['Open'],
+        high=plot_df_reset['High'],
+        low=plot_df_reset['Low'],
+        close=plot_df_reset['Close'],
+        increasing_line_color='lime',
+        decreasing_line_color='red',
+        name='Candlestick'
+    ), row=1, col=1)
+    # MA50, MA200
+    fig3.add_trace(go.Scatter(x=plot_df.index, y=plot_df['MA50'], name='MA50', line=dict(dash='dot', color='orange')), row=1, col=1)
+    fig3.add_trace(go.Scatter(x=plot_df.index, y=plot_df['MA200'], name='MA200', line=dict(dash='dot', color='red')), row=1, col=1)
+    # Confluence Zones als Rechtecke (nur Score >= Schwelle)
+    for zone in confluence_zones:
+        band_color = "rgba(0, 255, 0, 0.07)" if zone['score'] == 3 else \
+                     "rgba(255, 165, 0, 0.07)" if zone['score'] == 2 else \
+                     "rgba(128, 128, 128, 0.05)"
+        fig3.add_shape(
+            type="rect",
+            x0=plot_df.index[0], x1=plot_df.index[-1],
+            y0=zone['low'], y1=zone['high'],
+            fillcolor=band_color,
+            line=dict(width=0),
+            layer='below',
+            row=1, col=1
+        )
+        fig3.add_annotation(
+            x=plot_df.index[-1],
+            y=zone['level'],
+            text=f"{zone['score']}/3",
+            showarrow=False,
+            font=dict(size=10, color='white'),
+            bgcolor='rgba(0,0,0,0.6)',
+            bordercolor='gray',
+            borderwidth=1,
+            xanchor='left',
+            row=1, col=1
+        )
+    # Fibonacci (nur Basis-Levels)
+    basic_fibs = ["0.0", "0.236", "0.382", "0.5", "0.618", "0.786", "1.0"]
+    for lvl in basic_fibs:
+        if lvl in fib:
+            val = fib[lvl]
+            fig3.add_hline(
+                y=val,
+                line=dict(dash='dot', color='#555555'),
+                opacity=0.3,
+                row=1, col=1
+            )
+            fig3.add_annotation(
+                x=plot_df.index[-1],
+                y=val,
+                text=f"Fib {lvl}",
+                showarrow=False,
+                font=dict(size=10, color='#aaaaaa'),
+                bgcolor='rgba(0,0,0,0.2)',
+                bordercolor='#555555',
+                borderwidth=1,
+                xanchor='right',
+                row=1, col=1
+            )
+    # RSI Subplot
+    rsi_series = data['RSI'].dropna()
+    fig3.add_trace(
+        go.Scatter(x=rsi_series.index, y=rsi_series, name='RSI (14)', line=dict(color='deepskyblue', width=2)),
+        row=2, col=1
+    )
+    # RSI Schwellen
+    fig3.add_hline(y=float(70), line=dict(color='gray', dash='dash'), row=2, col=1)
+    fig3.add_hline(y=float(30), line=dict(color='gray', dash='dash'), row=2, col=1)
+    # Layout
+    fig3.update_layout(
+        plot_bgcolor='#131722',
+        paper_bgcolor='#131722',
+        font=dict(color='#dedede'),
+        hovermode="x unified",
+        title=dict(
+            text=f"{ticker} – Vereinfachte Trading-Ansicht",
+            x=0.5, xanchor='center',
+            font=dict(size=16, color='#ffffff')
+        ),
+        height=900
+    )
+    fig3.update_xaxes(
+        gridcolor='#2a2e39',
+        showline=True, linewidth=1, linecolor='#666666',
+        showspikes=True, spikecolor="white", spikethickness=1, spikedash='dot',
+        rangeslider_visible=False,
+        row=1, col=1
+    )
+    fig3.update_yaxes(
+        gridcolor='#2a2e39',
+        showline=True, linewidth=1, linecolor='#666666',
+        showspikes=True, spikecolor="white", spikethickness=1, spikedash='dot',
+        title_text="Preis",
+        row=1, col=1
+    )
+    fig3.update_yaxes(
+        gridcolor='#2a2e39',
+        showline=True, linewidth=1, linecolor='#666666',
+        title_text="RSI",
+        range=[0, 100],
+        row=2, col=1
+    )
+    # st.plotly_chart(fig3, use_container_width=True)
+else:
+    # --- Original Chartmuster-Overlay-Aufrufe und Fibonacci/Extensions ---
+    if show_channels:
+        # Für Beispiel: letzten 60 Punkte verwenden
+        channel_window = 60
+        channel_data = close_series[-channel_window:]
+        x_vals = np.arange(len(channel_data))
+
+        # Regressionslinien für obere und untere Extrempunkte
+        upper_quantile = channel_data.quantile(0.9)
+        lower_quantile = channel_data.quantile(0.1)
+
+        upper_idx = channel_data[channel_data >= upper_quantile].index
+        lower_idx = channel_data[channel_data <= lower_quantile].index
+
+        # Falls nicht genug Punkte für Regression, überspringen
+        if len(upper_idx) > 1 and len(lower_idx) > 1:
+            # Numerische X-Achsen für Regression
+            x_upper = mdates.date2num(upper_idx.to_pydatetime())
+            y_upper = channel_data[upper_idx]
+            from scipy.stats import linregress
+            slope_up, intercept_up, _, _, _ = linregress(x_upper, y_upper)
+
+            x_lower = mdates.date2num(lower_idx.to_pydatetime())
+            y_lower = channel_data[lower_idx]
+            slope_lo, intercept_lo, _, _, _ = linregress(x_lower, y_lower)
+
+            x_plot = mdates.date2num(channel_data.index.to_pydatetime())
+            upper_line = slope_up * x_plot + intercept_up
+            lower_line = slope_lo * x_plot + intercept_lo
+
+            # Channel-Bänder in Plotly
+            fig3.add_trace(go.Scatter(
+                x=channel_data.index, y=upper_line,
+                mode='lines', line=dict(color='lime', width=2), name='Channel Top'
+            ))
+            fig3.add_trace(go.Scatter(
+                x=channel_data.index, y=lower_line,
+                mode='lines', line=dict(color='red', width=2), name='Channel Bottom'
+            ))
+            fig3.add_trace(go.Scatter(
+                x=channel_data.index, y=(upper_line + lower_line) / 2,
+                mode='lines', line=dict(color='orange', dash='dash', width=1.5), name='Channel Mid'
+            ))
+
+            # Rechteck als Hintergrund (optional)
+            fig3.add_shape(
+                type="rect",
+                x0=channel_data.index[0], x1=channel_data.index[-1],
+                y0=min(lower_line), y1=max(upper_line),
+                fillcolor="rgba(0, 255, 0, 0.05)", line=dict(width=0),
+                layer="below"
+            )
+
+    # Fibonacci-Extensions in hellgrau
     for lvl, val in fib_ext.items():
-        color = '#ff9999' if trend == "up" else '#99ccff'
-        fig3.add_hline(y=val, line=dict(dash='dot', color=color), opacity=0.5)
+        fig3.add_hline(
+            y=val,
+            line=dict(dash='dot', color='#666666'),
+            opacity=0.4
+        )
         fig3.add_annotation(
             x=plot_df.index[-1],
             y=val,
-            text=f"Ext {lvl}: {val:.0f}",
+            text=f"Ext {lvl}",
             showarrow=False,
-            font=dict(size=11, color=color),
-            bgcolor='rgba(255,255,255,0.2)',
-            bordercolor=color,
+            font=dict(size=10, color='#aaaaaa'),
+            bgcolor='rgba(0,0,0,0.3)',
+            bordercolor='#666666',
             borderwidth=1,
-            xanchor='right',
-            yshift=15
+            xanchor='right'
         )
 
-# Fibonacci-Level als horizontale Linien mit Annotation links oben, grau
-for lvl, val in fib.items():
-    fig3.add_hline(y=val, line=dict(dash='dot', color='#cccccc'), opacity=0.5)
-    if plot_df.empty:
-        st.warning("Keine Daten im ausgewählten Zeitintervall verfügbar. Bitte Intervall oder Zeitraum ändern.")
-        st.stop()
+    # Fibonacci-Level in sehr hellem Grau
+    for lvl, val in fib.items():
+        fig3.add_hline(
+            y=val,
+            line=dict(dash='dot', color='#555555'),
+            opacity=0.3
+        )
+        fig3.add_annotation(
+            x=plot_df.index[-1],
+            y=val,
+            text=f"Fib {lvl}",
+            showarrow=False,
+            font=dict(size=10, color='#aaaaaa'),
+            bgcolor='rgba(0,0,0,0.2)',
+            bordercolor='#555555',
+            borderwidth=1,
+            xanchor='right'
+        )
+
+    # --- Chartmuster-Overlay-Aufrufe ---
+    if show_wedge:
+        add_wedge_overlay(fig3, close_series, window=60, name_prefix="Wedge")
+
+    if show_broadening:
+        add_broadening_overlay(fig3, close_series, window=80, name_prefix="Broadening")
+
+    if show_flag:
+        add_flag_channel(fig3, close_series, window=50, name_prefix="Flag")
+
+    if show_bb_breakouts:
+        add_bb_breakouts(fig3, data, name_prefix="BB Breakout")
+# --- Verbesserte Confluence-Zonen-Darstellung mit Rechtecken & Tabelle ---
+
+# Tabelle vorbereiten
+zones_table_df = pd.DataFrame([{
+    "Level (Mid)": round(zone["mid"], 2),
+    "Lower Band": round(zone["low"], 2),
+    "Upper Band": round(zone["high"], 2),
+    "Score": f"{zone['score']}/3"
+} for zone in confluence_zones])
+
+# Tabelle anzeigen (automatisch aktualisiert mit Prominenz-Slider)
+st.subheader("📄 Übersicht der Confluence Zonen")
+st.dataframe(zones_table_df)
+
+# Zonen als Rechtecke (Shapes) in Plotly-Chart
+for zone in confluence_zones:
+    color = "rgba(0, 255, 0, 0.2)" if zone["score"] == 3 else "rgba(255, 165, 0, 0.2)" if zone["score"] == 2 else "rgba(128, 128, 128, 0.2)"
+    fig3.add_shape(
+        type="rect",
+        x0=plot_df.index[0],  # links über ganzen Chart
+        x1=plot_df.index[-1], # rechts
+        y0=zone["low"],
+        y1=zone["high"],
+        line=dict(color=color.replace("0.2", "1.0"), width=1),
+        fillcolor=color,
+        layer="below"
+    )
+    # Preis-Annotation
+    label = f"{zone['low']:.0f}–{zone['high']:.0f}\n({zone['score']}/3)"
     fig3.add_annotation(
         x=plot_df.index[-1],
-        y=val,
-        text=f"Fib {lvl}: {val:.0f}",
+        y=zone["mid"],
+        text=label,
         showarrow=False,
-        font=dict(size=13, color='#cccccc'),
-        bgcolor='rgba(204, 204, 204, 0.2)',
-        bordercolor='#999999',
+        font=dict(size=12, color="white"),
+        bgcolor="rgba(0,0,0,0.6)",
+        bordercolor="gray",
         borderwidth=1,
-        xanchor='right',
-        yshift=15
+        xanchor="left"
     )
+#
+# --- Erweiterung: Profi-Kommentar zur RSI-Interpretation (aus Screenshot) ---
+with st.expander("🧠 Profi-Insight: RSI verstehen & Kontext", expanded=False):
+    st.markdown("""
+    Klassische Parameter wie **RSI**, Stochastic Oscillator oder Williams %R geben wertvolle Hinweise, sind aber oft interpretationsbedürftig.
+    Ein hoher RSI muss nicht zwingend zu einer Korrektur führen, er kann auch nur abkühlen, während der Markt konsolidiert oder Seitwärts läuft. 
+    Zum Beispiel können andere Sektoren relative Stärke zeigen, sodass der Gesamtindex trotz hohem RSI nicht fällt.
 
-# --- Checkbox für Fibonacci Extensions war hier vorher außerhalb des Expanders ---
-# (Entfernt, da sie jetzt im Expander "🔍 Anzeigen" ist)
+    **Wichtig:** 
+    - RSI über 70 ≠ automatisch Short-Signal.
+    - RSI sollte immer mit Sektorenrotation, Marktstruktur und Sentiment kombiniert werden.
+    - Laut Backtests liefert "immer Short gehen bei RSI > 70" keine profitable Performance ohne korrektes Risiko-Management.
 
-fig3.update_layout(
-    title=dict(text=f"{ticker} – Interaktiver Chart", x=0.5, xanchor='center', font=dict(size=16, family="Arial", color='#ffffff', weight='bold')),
-    xaxis_title=dict(text="Datum", font=dict(color='#ffffff', size=14, family="Arial", weight='bold')),
-    yaxis_title=dict(text="Preis", font=dict(color='#ffffff', size=14, family="Arial", weight='bold')),
-    plot_bgcolor='#1e1e1e',
-    paper_bgcolor='#1e1e1e',
-    font=dict(color='#ffffff'),
-    xaxis=dict(gridcolor='#444444', rangeslider_visible=False),
-    yaxis=dict(gridcolor='#444444', autorange=True)
-)
+    👉 Nutze RSI lieber als einen Hinweis zur Überhitzung, nicht als alleinigen Trigger.
+    """)
 
 # --- Verbesserter LSTM Forecast mit Unsicherheitsband und Reversion ---
 st.subheader("🔮 Verbesserter LSTM Forecast mit Unsicherheitsband")
@@ -1225,6 +1679,9 @@ with st.expander("📊 Zusätzliche Makro-Charts"):
         st.caption("Externe Quelle: multpl.com – aktuelle PE Ratio immer live.")
    # if 'show_spxa200r' in locals() and show_spxa200r:
    #    plot_bpspx_chart()
+
+
+
 
 
 # 📊 Sektorrotation
