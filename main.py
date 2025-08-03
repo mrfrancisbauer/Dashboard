@@ -1913,6 +1913,7 @@ st.pyplot(fig2)
 
 
 
+
 # Sidebar: Erklärung Confluence Zone
 with st.sidebar.expander("ℹ️ Erklärung: Confluence Zone"):
     st.markdown("""
