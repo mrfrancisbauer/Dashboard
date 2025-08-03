@@ -19,6 +19,173 @@ from tensorflow.keras.models import load_model
 from tensorflow.keras.callbacks import ModelCheckpoint
 import os
 
+# =================== NEU: DB-Chart-Block für Ticker-Auswahl und Forecast ==========================
+import streamlit as st
+import sqlite3
+import pandas as pd
+import matplotlib.pyplot as plt
+import requests
+
+
+# --- DB-Verbindung ---
+DB_PATH = "market_dashboard.db"
+conn = sqlite3.connect(DB_PATH)
+
+# --- Ticker aus der DB laden ---
+tickers_df = pd.read_sql("SELECT DISTINCT ticker FROM historical_prices", conn)
+tickers = tickers_df['ticker'].tolist()
+
+# --- Sidebar: Ticker Auswahl ---
+selected_ticker = st.sidebar.selectbox("Ticker auswählen", tickers)
+
+# --- Daten aus DB laden ---
+prices_query = f"""
+    SELECT date, open, high, low, close, volume 
+    FROM historical_prices
+    WHERE ticker = ?
+    ORDER BY date
+"""
+prices_df = pd.read_sql(prices_query, conn, params=(selected_ticker,))
+prices_df['date'] = pd.to_datetime(prices_df['date'])
+
+# --- Forecast aus DB laden ---
+forecast_query = f"""
+    SELECT forecast_date, forecast, upper_band, lower_band 
+    FROM lstm_forecasts
+    WHERE ticker = ?
+    ORDER BY forecast_date
+"""
+forecast_df = pd.read_sql(forecast_query, conn, params=(selected_ticker,))
+forecast_df['forecast_date'] = pd.to_datetime(forecast_df['forecast_date'])
+
+# --- Chart Plot ---
+fig, ax = plt.subplots(figsize=(12, 6))
+ax.plot(prices_df['date'], prices_df['close'], label="Close Price", color='black')
+
+if not forecast_df.empty:
+    ax.plot(forecast_df['forecast_date'], forecast_df['forecast'], label="Forecast", color='blue')
+    ax.fill_between(
+        forecast_df['forecast_date'],
+        forecast_df['lower_band'],
+        forecast_df['upper_band'],
+        color='blue',
+        alpha=0.2,
+        label="Forecast Band"
+    )
+
+ax.set_title(f"{selected_ticker} Preis & Forecast")
+ax.set_xlabel("Datum")
+ax.set_ylabel("Preis")
+ax.legend()
+
+st.pyplot(fig)
+
+# --- Optional: Tabelle zeigen ---
+if st.checkbox("Historische Preisdaten anzeigen"):
+    st.dataframe(prices_df)
+
+if st.checkbox("Forecast-Daten anzeigen"):
+    st.dataframe(forecast_df)
+
+# --- DB schließen ---
+conn.close()
+# =================== ENDE NEU: DB-Chart-Block ==========================
+
+# ==== DB Imports ====
+import sqlite3
+import json
+# ==== DB Setup & Utility-Funktionen ====
+conn = sqlite3.connect("market_dashboard.db", check_same_thread=False)
+cursor = conn.cursor()
+
+# Tabellen anlegen
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS historical_prices (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ticker TEXT,
+    date TEXT,
+    open REAL,
+    high REAL,
+    low REAL,
+    close REAL,
+    volume REAL
+)
+""")
+
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS lstm_forecasts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ticker TEXT,
+    date_generated TEXT,
+    forecast_date TEXT,
+    forecast REAL,
+    upper_band REAL,
+    lower_band REAL,
+    model_params_json TEXT
+)
+""")
+
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS confluence_zones (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ticker TEXT,
+    level REAL,
+    score INTEGER,
+    low REAL,
+    high REAL,
+    generated_at TEXT
+)
+""")
+conn.commit()
+
+def upsert_forecast(ticker, forecast_df, params_dict):
+    for _, row in forecast_df.iterrows():
+        params_json = json.dumps(params_dict)
+        cursor.execute("""
+        INSERT INTO lstm_forecasts (ticker, date_generated, forecast_date, forecast, upper_band, lower_band, model_params_json)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        """, (
+            ticker,
+            pd.Timestamp.today().strftime("%Y-%m-%d"),
+            row['Date'].strftime("%Y-%m-%d"),
+            float(row['Forecast']),
+            float(row['Upper']),
+            float(row['Lower']),
+            params_json
+        ))
+    conn.commit()
+
+def upsert_zones(ticker, zones_list):
+    for zone in zones_list:
+        cursor.execute("""
+        INSERT INTO confluence_zones (ticker, level, score, low, high, generated_at)
+        VALUES (?, ?, ?, ?, ?, ?)
+        """, (
+            ticker,
+            float(zone['level']),
+            int(zone['score']),
+            float(zone['low']),
+            float(zone['high']),
+            pd.Timestamp.today().strftime("%Y-%m-%d")
+        ))
+    conn.commit()
+
+def upsert_prices(ticker, df):
+    for idx, row in df.iterrows():
+        cursor.execute("""
+        INSERT OR REPLACE INTO historical_prices (ticker, date, open, high, low, close, volume)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        """, (
+            ticker,
+            idx.strftime("%Y-%m-%d"),
+            float(row['Open']),
+            float(row['High']),
+            float(row['Low']),
+            float(row['Close']),
+            float(row.get('Volume', 0))
+        ))
+    conn.commit()
+
 # ==== NEUE FUNKTIONEN: Exakter Haupt-Channel & RSI-Trendlinie ====
 def add_precise_channel(fig, series, start_idx=None, end_idx=None, color="blue", name_prefix="Main Channel"):
     sub_series = series
@@ -69,7 +236,7 @@ def plot_spx_monthly_ma_chart():
     df['MA20'] = df['Close'].rolling(window=20).mean()
     df['MA50'] = df['Close'].rolling(window=50).mean()
 
-    fig, ax = plt.subplots(figsize=(10, 5))
+    fig, ax = plt.subplots(figsize=(12, 5))
     ax.plot(df.index, df['Close'], label='SPX Monthly Close', color='black')
     ax.plot(df.index, df['EMA5'], label='EMA5', linestyle='--', alpha=0.7)
     ax.plot(df.index, df['EMA14'], label='EMA14', linestyle='--', alpha=0.7)
@@ -164,7 +331,7 @@ default_end_date = pd.to_datetime("today") + pd.Timedelta(days=1)
 end_date = st.sidebar.date_input("📅 Enddatum", value=default_end_date)
 ## Remove sliders for RSI/MA/Volume thresholds, use fixed defaults
 rsi_buy_threshold = 30
-rsi_test_threshold = 50
+#rsi_test_threshold = 50
 ma_buy_distance = 3
 price_bins = 50
 
@@ -293,7 +460,6 @@ def load_data(ticker, start, end, interval):
     df['EMA_5W'] = df['Close'].ewm(span=5 * 5, adjust=False).mean()  # 5 Wochen EMA auf Tagesbasis
     df['EMA_5Y'] = df['Close'].ewm(span=5 * 252, adjust=False).mean()  # 5 Jahres EMA auf Tagesbasis
     df['MA20'] = df['Close'].rolling(window=20).mean()
-    df['MA100'] = df['Close'].rolling(window=100).mean()
 
     bb = BollingerBands(close=df['Close'].squeeze(), window=20, window_dev=2)
     df['BB_upper'] = bb.bollinger_hband()
@@ -306,6 +472,8 @@ if st.button("🔄 Daten neu laden"):
 data = load_data(ticker, start_date, end_date, interval)
 data.index = pd.to_datetime(data.index)
 close_series = data['Close_Series']
+# --- DB Insert: historical_prices
+upsert_prices(ticker, data)
 
 
 def identify_zone_ranges(series, prominence=0.5):
@@ -327,7 +495,7 @@ test_zone_df = pd.DataFrame({'Level': test_levels})
 
 # Buy-/Test-Zonen (manuell, für Signalpunkte)
 buy_zone = data[(close_series < data['MA200'] * (1 + ma_buy_distance / 100)) & (data['RSI'] < rsi_buy_threshold)]
-test_zone = data[(close_series > data['MA50'] * 1.05) & (data['RSI'] > rsi_test_threshold)]
+#test_zone = data[(close_series > data['MA50'] * 1.05) & (data['RSI'] > rsi_test_threshold)]
 
 # Fibonacci-Level
 low = close_series.min()
@@ -415,7 +583,7 @@ ax.plot(data['BB_mid'], label='BB Mid', linestyle='--', color='purple', alpha=0.
 
 # Signalpunkte
 ax.scatter(buy_zone.index, close_series.loc[buy_zone.index], label='Buy Zone (Signal)', marker='o', color='green', s=80)
-ax.scatter(test_zone.index, close_series.loc[test_zone.index], label='Test Zone (Signal)', marker='x', color='red', s=80)
+#ax.scatter(test_zone.index, close_series.loc[test_zone.index], label='Test Zone (Signal)', marker='x', color='red', s=80)
 
 
 ## Remove all sliders for RSI, MA-Nähe, Y-Achsen-Zoom, Clustering-Schwelle und Volume-Bins
@@ -528,6 +696,8 @@ confluence_zones = find_confluence_zones(
 )
 # Filtere nach Score
 confluence_zones = [z for z in confluence_zones if z['score'] >= selected_min_score]
+# --- DB Insert: confluence_zones
+upsert_zones(ticker, confluence_zones)
 # Zeichne Confluence Zones als horizontale Linien mit neuem Label-Stil
 #
 # --- Neue Beschriftung der Confluence Zones weiter rechts, mit Preisbereich, automatischer Versatz ---
@@ -769,9 +939,9 @@ export_df = pd.DataFrame({
     'Close': close_series,
     'RSI': data['RSI'],
     'MA50': data['MA50'],
-    'MA200': data['MA200'],
-    'Buy_Zone': close_series.index.isin(buy_zone.index),
-    'Test_Zone': close_series.index.isin(test_zone.index)
+    'MA200': data['MA200']
+    #'Buy_Zone': close_series.index.isin(buy_zone.index),
+    #'Test_Zone': close_series.index.isin(test_zone.index)
 })
 csv = export_df.to_csv(index=False)
 #st.download_button("📥 Exportiere Buy-/Test-Zonen als CSV", data=csv, file_name=f'{ticker}_zones.csv', mime='text/csv')
@@ -784,10 +954,10 @@ st.write(f"Datapoints: {len(data)}")  # Zeigt Anzahl der Zeilen im DataFrame
 st.subheader("📊 Interaktiver Chart")
 # Prepare buy_signals and test_signals for plotting
 plot_df = data.copy()
-plot_df['Buy Signal'] = np.where(plot_df.index.isin(buy_zone.index), plot_df['Close_Series'], np.nan)
-plot_df['Test Signal'] = np.where(plot_df.index.isin(test_zone.index), plot_df['Close_Series'], np.nan)
-buy_signals = plot_df['Buy Signal'].dropna()
-test_signals = plot_df['Test Signal'].dropna()
+#plot_df['Buy Signal'] = np.where(plot_df.index.isin(buy_zone.index), plot_df['Close_Series'], np.nan)
+#plot_df['Test Signal'] = np.where(plot_df.index.isin(test_zone.index), plot_df['Close_Series'], np.nan)
+#buy_signals = plot_df['Buy Signal'].dropna()
+#test_signals = plot_df['Test Signal'].dropna()
 
 from plotly.subplots import make_subplots
 fig3 = make_subplots(
@@ -815,16 +985,16 @@ if show_indicators:
     fig3.add_trace(go.Scatter(x=plot_df.index, y=plot_df['BB_lower'], name='BB Lower', line=dict(dash='dot', color='purple'), opacity=0.6), row=1, col=1)
     fig3.add_trace(go.Scatter(x=plot_df.index, y=plot_df['BB_mid'], name='BB Mid', line=dict(dash='dot', color='violet'), opacity=0.4), row=1, col=1)
 
-# Bedingte Anzeige der Buy/Test Signale (row=1, col=1)
-if show_signals:
-    if not buy_signals.empty:
-        fig3.add_trace(go.Scatter(
-            x=buy_signals.index, y=buy_signals, mode='markers', name='Buy Signal',
-            marker=dict(symbol='circle', size=10, color='green')), row=1, col=1)
-    if not test_signals.empty:
-        fig3.add_trace(go.Scatter(
-            x=test_signals.index, y=test_signals, mode='markers', name='Test Signal',
-            marker=dict(symbol='x', size=10, color='red')), row=1, col=1)
+# # Bedingte Anzeige der Buy/Test Signale (row=1, col=1)
+# if show_signals:
+#     if not buy_signals.empty:
+#         fig3.add_trace(go.Scatter(
+#             x=buy_signals.index, y=buy_signals, mode='markers', name='Buy Signal',
+#             marker=dict(symbol='circle', size=10, color='green')), row=1, col=1)
+#     if not test_signals.empty:
+#         fig3.add_trace(go.Scatter(
+#             x=test_signals.index, y=test_signals, mode='markers', name='Test Signal',
+#             marker=dict(symbol='x', size=10, color='red')), row=1, col=1)
 
 # ==== Neue Overlays: Exakter Haupt-Channel & RSI-Trendlinie (row=1, col=1) ====
 if show_precise_channel:
@@ -866,6 +1036,11 @@ fig3.add_trace(go.Candlestick(
 from scipy.stats import linregress
 import matplotlib.dates as mdates
 
+"""
+Wedge & Broadening Muster mit Konvergenz-/Divergenzprüfung:
+- Wedge: Linien laufen zusammen (Konvergenz)
+- Broadening: Linien laufen auseinander (Divergenz)
+"""
 def add_wedge_overlay(fig, series, window=60, name_prefix="Wedge"):
     sub_series = series[-window:]
     upper_idx = sub_series[sub_series >= sub_series.quantile(0.9)].index
@@ -880,21 +1055,28 @@ def add_wedge_overlay(fig, series, window=60, name_prefix="Wedge"):
         y_lower = sub_series[lower_idx]
         slope_lo, intercept_lo, _, _, _ = linregress(x_lower, y_lower)
 
-        x_plot = mdates.date2num(sub_series.index.to_pydatetime())
-        upper_line = slope_up * x_plot + intercept_up
-        lower_line = slope_lo * x_plot + intercept_lo
+        # Konvergenz explizit prüfen: Abstand der Linien am Ende < am Anfang
+        x_start = mdates.date2num(sub_series.index[0])
+        x_end = mdates.date2num(sub_series.index[-1])
+        width_start = (slope_up * x_start + intercept_up) - (slope_lo * x_start + intercept_lo)
+        width_end = (slope_up * x_end + intercept_up) - (slope_lo * x_end + intercept_lo)
 
-        fig.add_trace(go.Scatter(x=sub_series.index, y=upper_line,
-                                 mode='lines', line=dict(color='yellow', width=2),
-                                 name=f"{name_prefix} Top"))
-        fig.add_trace(go.Scatter(x=sub_series.index, y=lower_line,
-                                 mode='lines', line=dict(color='yellow', width=2),
-                                 name=f"{name_prefix} Bottom"))
-        fig.add_shape(type="rect",
-                      x0=sub_series.index[0], x1=sub_series.index[-1],
-                      y0=min(lower_line), y1=max(upper_line),
-                      fillcolor="rgba(255, 255, 0, 0.05)", line=dict(width=0),
-                      layer="below")
+        if width_end < width_start:
+            x_plot = mdates.date2num(sub_series.index.to_pydatetime())
+            upper_line = slope_up * x_plot + intercept_up
+            lower_line = slope_lo * x_plot + intercept_lo
+
+            fig.add_trace(go.Scatter(x=sub_series.index, y=upper_line,
+                                     mode='lines', line=dict(color='yellow', width=2),
+                                     name=f"{name_prefix} Top"))
+            fig.add_trace(go.Scatter(x=sub_series.index, y=lower_line,
+                                     mode='lines', line=dict(color='yellow', width=2),
+                                     name=f"{name_prefix} Bottom"))
+            fig.add_shape(type="rect",
+                          x0=sub_series.index[0], x1=sub_series.index[-1],
+                          y0=min(lower_line), y1=max(upper_line),
+                          fillcolor="rgba(255, 255, 0, 0.05)", line=dict(width=0),
+                          layer="below")
 
 def add_broadening_overlay(fig, series, window=80, name_prefix="Broadening"):
     sub_series = series[-window:]
@@ -910,7 +1092,13 @@ def add_broadening_overlay(fig, series, window=80, name_prefix="Broadening"):
         y_lower = sub_series[lower_idx]
         slope_lo, intercept_lo, _, _, _ = linregress(x_lower, y_lower)
 
-        if slope_up - slope_lo > 0.00001:
+        # Divergenz explizit prüfen: Abstand der Linien am Ende > am Anfang
+        x_start = mdates.date2num(sub_series.index[0])
+        x_end = mdates.date2num(sub_series.index[-1])
+        width_start = (slope_up * x_start + intercept_up) - (slope_lo * x_start + intercept_lo)
+        width_end = (slope_up * x_end + intercept_up) - (slope_lo * x_end + intercept_lo)
+
+        if width_end > width_start:
             x_plot = mdates.date2num(sub_series.index.to_pydatetime())
             upper_line = slope_up * x_plot + intercept_up
             lower_line = slope_lo * x_plot + intercept_lo
@@ -1025,7 +1213,7 @@ for zone in confluence_zones:
         y=zone['level'],
         text=f"{zone['score']}/3",
         showarrow=False,
-        font=dict(size=10, color='white'),
+        font=dict(size=12, color='white'),
         bgcolor='rgba(0,0,0,0.6)',
         bordercolor='gray',
         borderwidth=1,
@@ -1124,7 +1312,7 @@ if vereinfachte_trading:
                 y=val,
                 text=f"Fib {lvl}",
                 showarrow=False,
-                font=dict(size=10, color='#aaaaaa'),
+                font=dict(size=12, color='#aaaaaa'),
                 bgcolor='rgba(0,0,0,0.2)',
                 bordercolor='#555555',
                 borderwidth=1,
@@ -1241,7 +1429,7 @@ else:
             y=val,
             text=f"Ext {lvl}",
             showarrow=False,
-            font=dict(size=10, color='#aaaaaa'),
+            font=dict(size=12, color='#aaaaaa'),
             bgcolor='rgba(0,0,0,0.3)',
             bordercolor='#666666',
             borderwidth=1,
@@ -1260,7 +1448,7 @@ else:
             y=val,
             text=f"Fib {lvl}",
             showarrow=False,
-            font=dict(size=10, color='#aaaaaa'),
+            font=dict(size=12, color='#aaaaaa'),
             bgcolor='rgba(0,0,0,0.2)',
             bordercolor='#555555',
             borderwidth=1,
@@ -1451,6 +1639,15 @@ if show_lstm:
 
     st.subheader("🗒️ Forecast-Tabelle (LSTM)")
     st.dataframe(forecast_df.style.format({"Forecast": "{:.2f}", "Upper": "{:.2f}", "Lower": "{:.2f}"}))
+
+    # --- DB Insert: lstm_forecasts
+    params = {
+        "seq_length": sequence_length,
+        "features": list(features_df.columns),
+        "epochs": epochs,
+        "batch_size": batch_size
+    }
+    upsert_forecast(ticker, forecast_df, params)
 
     # Traces
     forecast_trace = go.Scatter(x=forecast_df['Date'], y=forecast_df['Forecast'], mode='lines+markers',
@@ -1681,9 +1878,6 @@ with st.expander("📊 Zusätzliche Makro-Charts"):
    #    plot_bpspx_chart()
 
 
-
-
-
 # 📊 Sektorrotation
 st.header("📊 Sektorrotation")
 period_map = {"1 Monat": "1mo", "3 Monate": "3mo", "6 Monate": "6mo", "12 Monate": "1y"}
@@ -1725,3 +1919,6 @@ with st.sidebar.expander("ℹ️ Erklärung: Confluence Zone"):
     Eine **Confluence Zone** entsteht, wenn mehrere technische Indikatoren (z. B. Fibonacci, gleitende Durchschnitte, Volumencluster) im selben Preisbereich zusammenfallen. 
     Diese Zonen gelten als besonders relevant für mögliche Umkehrpunkte oder Breakouts.
     """)
+
+# Optional: Am Ende Verbindung schließen (in Streamlit meist nicht nötig)
+# conn.close()
