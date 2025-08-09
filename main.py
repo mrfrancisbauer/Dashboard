@@ -19,81 +19,11 @@ from tensorflow.keras.models import load_model
 from tensorflow.keras.callbacks import ModelCheckpoint
 import os
 
-# =================== NEU: DB-Chart-Block für Ticker-Auswahl und Forecast ==========================
-import streamlit as st
-import sqlite3
-import pandas as pd
-import matplotlib.pyplot as plt
-import requests
-
-
-# --- DB-Verbindung ---
-DB_PATH = "market_dashboard.db"
-conn = sqlite3.connect(DB_PATH)
-
-# --- Ticker aus der DB laden ---
-tickers_df = pd.read_sql("SELECT DISTINCT ticker FROM historical_prices", conn)
-tickers = tickers_df['ticker'].tolist()
-
-# --- Sidebar: Ticker Auswahl ---
-selected_ticker = st.sidebar.selectbox("Ticker auswählen", tickers)
-
-# --- Daten aus DB laden ---
-prices_query = f"""
-    SELECT date, open, high, low, close, volume 
-    FROM historical_prices
-    WHERE ticker = ?
-    ORDER BY date
-"""
-prices_df = pd.read_sql(prices_query, conn, params=(selected_ticker,))
-prices_df['date'] = pd.to_datetime(prices_df['date'])
-
-# --- Forecast aus DB laden ---
-forecast_query = f"""
-    SELECT forecast_date, forecast, upper_band, lower_band 
-    FROM lstm_forecasts
-    WHERE ticker = ?
-    ORDER BY forecast_date
-"""
-forecast_df = pd.read_sql(forecast_query, conn, params=(selected_ticker,))
-forecast_df['forecast_date'] = pd.to_datetime(forecast_df['forecast_date'])
-
-# --- Chart Plot ---
-fig, ax = plt.subplots(figsize=(12, 6))
-ax.plot(prices_df['date'], prices_df['close'], label="Close Price", color='black')
-
-if not forecast_df.empty:
-    ax.plot(forecast_df['forecast_date'], forecast_df['forecast'], label="Forecast", color='blue')
-    ax.fill_between(
-        forecast_df['forecast_date'],
-        forecast_df['lower_band'],
-        forecast_df['upper_band'],
-        color='blue',
-        alpha=0.2,
-        label="Forecast Band"
-    )
-
-ax.set_title(f"{selected_ticker} Preis & Forecast")
-ax.set_xlabel("Datum")
-ax.set_ylabel("Preis")
-ax.legend()
-
-st.pyplot(fig)
-
-# --- Optional: Tabelle zeigen ---
-if st.checkbox("Historische Preisdaten anzeigen"):
-    st.dataframe(prices_df)
-
-if st.checkbox("Forecast-Daten anzeigen"):
-    st.dataframe(forecast_df)
-
-# --- DB schließen ---
-conn.close()
-# =================== ENDE NEU: DB-Chart-Block ==========================
 
 # ==== DB Imports ====
 import sqlite3
 import json
+DB_PATH = "market_dashboard.db"
 # ==== DB Setup & Utility-Funktionen ====
 conn = sqlite3.connect("market_dashboard.db", check_same_thread=False)
 cursor = conn.cursor()
@@ -138,6 +68,17 @@ CREATE TABLE IF NOT EXISTS confluence_zones (
 """)
 conn.commit()
 
+# --- Trading-Log Tabelle anlegen, falls nicht vorhanden ---
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS trading_results (
+    trade_date TEXT,
+    product    TEXT,
+    pnl        REAL,
+    PRIMARY KEY(trade_date, product)
+)
+""")
+conn.commit()
+
 def upsert_forecast(ticker, forecast_df, params_dict):
     for _, row in forecast_df.iterrows():
         params_json = json.dumps(params_dict)
@@ -154,6 +95,27 @@ def upsert_forecast(ticker, forecast_df, params_dict):
             params_json
         ))
     conn.commit()
+
+# --- Trading-Log: Upsert und Laden (verwenden DB_PATH) ---
+def upsert_trading_result(trade_date, product, pnl):
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    cur = conn.cursor()
+    cur.execute("""
+        INSERT INTO trading_results (trade_date, product, pnl)
+        VALUES (?, ?, ?)
+        ON CONFLICT(trade_date, product) DO UPDATE SET pnl = excluded.pnl
+    """, (trade_date.strftime("%Y-%m-%d"), product, pnl))
+    conn.commit()
+    conn.close()
+
+def load_trading_results():
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    df = pd.read_sql_query(
+        "SELECT trade_date, product, pnl FROM trading_results ORDER BY trade_date",
+        conn
+    )
+    conn.close()
+    return df
 
 def upsert_zones(ticker, zones_list):
     for zone in zones_list:
@@ -224,36 +186,235 @@ def add_precise_channel(fig, series, start_idx=None, end_idx=None, color="blue",
                       layer="below")
 
 
-# --- Inserted function: plot_spx_monthly_ma_chart() ---
-def plot_spx_monthly_ma_chart():
 
-    # SPX laden (Monthly)
-    df = yf.download("^GSPC", start="2015-01-01", interval="1mo")
-    df.dropna(inplace=True)
-    df['EMA5'] = df['Close'].ewm(span=5, adjust=False).mean()
-    df['EMA14'] = df['Close'].ewm(span=14, adjust=False).mean()
-    df['EMA20'] = df['Close'].ewm(span=20, adjust=False).mean()
-    df['MA20'] = df['Close'].rolling(window=20).mean()
-    df['MA50'] = df['Close'].rolling(window=50).mean()
 
-    fig, ax = plt.subplots(figsize=(12, 5))
-    ax.plot(df.index, df['Close'], label='SPX Monthly Close', color='black')
-    ax.plot(df.index, df['EMA5'], label='EMA5', linestyle='--', alpha=0.7)
-    ax.plot(df.index, df['EMA14'], label='EMA14', linestyle='--', alpha=0.7)
-    ax.plot(df.index, df['EMA20'], label='EMA20', linestyle='--', alpha=0.7)
-    ax.plot(df.index, df['MA20'], label='MA20', linestyle=':', alpha=0.7)
-    ax.plot(df.index, df['MA50'], label='MA50', linestyle=':', alpha=0.7)
-    ax.set_title("SPX Monthly Close + MAs")
-    ax.set_ylabel("Index Level")
-    ax.grid(True)
-    ax.legend()
-    ax.xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m'))
-    plt.xticks(rotation=45)
-    st.pyplot(fig)
 
+# === Investing Tab (Stock Screener) ===
+# -- Small utilities reused by the screener --
+
+def _cagr(first: float, last: float, years: int):
+    import numpy as _np
+    try:
+        if first is None or last is None or years <= 0 or first <= 0:
+            return _np.nan
+        return (last / first) ** (1 / years) - 1
+    except Exception:
+        return _np.nan
+
+def _clean_ratio(numer, denom):
+    import pandas as _pd
+    try:
+        if denom is None or denom == 0 or _pd.isna(numer) or _pd.isna(denom):
+            return _np.nan
+        return float(numer) / float(denom)
+    except Exception:
+        return _np.nan
+
+
+def _get_row(df, row_name):
+    try:
+        s = df.loc[row_name]
+        return s.sort_index()
+    except Exception:
+        import pandas as _pd
+        return _pd.Series(dtype="float64")
+
+
+def _compute_screener_metrics(tk: str):
+    """Compute a compact set of quality and price metrics for a ticker using yfinance."""
+    import yfinance as _yf
+    import numpy as _np
+    import pandas as _pd
+
+    t = _yf.Ticker(tk)
+    info = t.info
+    fin = t.financials
+    bs = t.balance_sheet
+    cf = t.cashflow
+
+    # pull series
+    revenue = _get_row(fin, "Total Revenue")
+    net_income = _get_row(fin, "Net Income")
+    gross_profit = _get_row(fin, "Gross Profit")
+    ebit = _get_row(fin, "Ebit") if "Ebit" in fin.index else _get_row(fin, "EBIT")
+    interest_exp = _get_row(fin, "Interest Expense")
+    total_equity = _get_row(bs, "Total Stockholder Equity")
+    total_debt = _get_row(bs, "Total Debt")
+    cash = _get_row(bs, "Cash And Cash Equivalents")
+    op_cf = _get_row(cf, "Operating Cash Flow")
+    capex = _get_row(cf, "Capital Expenditure") * -1
+    fcf = op_cf - capex
+
+    # derive
+    def _first_last(series):
+        s = series.dropna().sort_index()
+        if len(s) < 2:
+            return (_np.nan, _np.nan, 0)
+        return float(s.iloc[0]), float(s.iloc[-1]), max(1, len(s) - 1)
+
+    sales_cagr = _np.nan
+    profit_cagr = _np.nan
+    r1, r2, ry = _first_last(revenue.tail(5))
+    n1, n2, ny = _first_last(net_income.tail(5))
+    if ry >= 2:
+        sales_cagr = _cagr(r1, r2, ry)
+    if ny >= 2:
+        profit_cagr = _cagr(n1, n2, ny)
+
+    try:
+        roe = _clean_ratio(float(net_income.sort_index().iloc[-1]), float(total_equity.sort_index().iloc[-1]))
+    except Exception:
+        roe = _np.nan
+
+    try:
+        dte = _clean_ratio(float(total_debt.sort_index().iloc[-1]), float(total_equity.sort_index().iloc[-1]))
+    except Exception:
+        dte = _np.nan
+
+    try:
+        gm_latest = float((gross_profit / revenue).dropna().sort_index().iloc[-1])
+        gm_std = float((gross_profit / revenue).dropna().std())
+    except Exception:
+        gm_latest, gm_std = _np.nan, _np.nan
+
+    try:
+        icov = _clean_ratio(float(ebit.sort_index().iloc[-1]), abs(float(interest_exp.sort_index().iloc[-1])) if len(interest_exp) else _np.nan)
+    except Exception:
+        icov = _np.nan
+
+    # price ratios
+    pe = info.get("trailingPE", _np.nan)
+    price = info.get("currentPrice", _np.nan)
+    mcap = info.get("marketCap", _np.nan)
+    shares = info.get("sharesOutstanding", _np.nan)
+    try:
+        fcf_latest = float(fcf.sort_index().iloc[-1])
+        fcf_yield = fcf_latest / mcap if mcap and not _np.isnan(mcap) and mcap > 0 else _np.nan
+    except Exception:
+        fcf_latest, fcf_yield = _np.nan, _np.nan
+
+    # EV/EBIT
+    try:
+        debt_latest = float(total_debt.sort_index().iloc[-1]) if len(total_debt) else _np.nan
+        cash_latest = float(cash.sort_index().iloc[-1]) if len(cash) else _np.nan
+        ev = (mcap or _np.nan) + (debt_latest or 0) - (cash_latest or 0)
+        ebit_latest = float(ebit.sort_index().iloc[-1]) if len(ebit) else _np.nan
+        ev_ebit = ev / ebit_latest if (not _np.isnan(ev) and not _np.isnan(ebit_latest) and ebit_latest != 0) else _np.nan
+    except Exception:
+        ev_ebit = _np.nan
+
+    sector = info.get("sector", "")
+    name = info.get("shortName", tk)
+
+    return {
+        "ticker": tk,
+        "name": name,
+        "sector": sector,
+        "pe": pe,
+        "ev_ebit": ev_ebit,
+        "fcf_yield": fcf_yield,
+        "sales_cagr": sales_cagr,
+        "profit_cagr": profit_cagr,
+        "roe": roe,
+        "dte": dte,
+        "gross_margin": gm_latest,
+        "gross_margin_std": gm_std,
+        "market_cap": mcap,
+        "price": price,
+    }
+
+
+def render_investing_tab():
+    """Render a compact stock screener tab based on the hand-drawn framework."""
+    import streamlit as _st
+    import pandas as _pd
+    import numpy as _np
+
+    _st.header("💼 Investing – Stock Screener (Quality & Price)")
+
+    with _st.expander("🔧 Einstellungen", expanded=True):
+        tickers_text = _st.text_area(
+            "Tickers (kommagetrennt)",
+            value="AAPL, MSFT, NVDA, KO, PG, JNJ, META, GOOGL, ADBE, MA, V"
+        )
+        # Schwellenwerte – nahe am Poster
+        col1, col2, col3 = _st.columns(3)
+        with col1:
+            min_sales = _st.number_input("Sales CAGR ≥", min_value=0.0, max_value=0.5, value=0.07, step=0.01)
+            min_profit = _st.number_input("Profit CAGR ≥", min_value=0.0, max_value=0.5, value=0.07, step=0.01)
+        with col2:
+            min_roe = _st.number_input("ROE ≥", min_value=0.0, max_value=1.0, value=0.20, step=0.01)
+            max_dte = _st.number_input("Debt/Equity ≤", min_value=0.0, max_value=5.0, value=1.0, step=0.1)
+        with col3:
+            max_pe = _st.number_input("P/E ≤", min_value=0.0, max_value=200.0, value=25.0, step=1.0)
+            max_ev_ebit = _st.number_input("EV/EBIT ≤", min_value=0.0, max_value=200.0, value=18.0, step=1.0)
+            min_fcfy = _st.number_input("FCF‑Yield ≥", min_value=0.0, max_value=0.2, value=0.03, step=0.005)
+        run = _st.button("🚀 Screen starten")
+
+    if not run:
+        _st.info("Konfiguriere die Schwellen & klicke auf **Screen starten**.")
+        return
+
+    tks = [t.strip().upper() for t in tickers_text.split(',') if t.strip()]
+    rows = []
+    for tk in tks:
+        try:
+            rows.append(_compute_screener_metrics(tk))
+        except Exception as e:
+            rows.append({"ticker": tk, "error": str(e)})
+
+    df = _pd.DataFrame(rows)
+
+    # Qualitäts- und Preis-Filter anwenden
+    quality_mask = (
+        (df["sales_cagr"] >= min_sales) &
+        (df["profit_cagr"] >= min_profit) &
+        (df["roe"] >= min_roe) &
+        (df["dte"] <= max_dte)
+    )
+    moat_hint = (
+        (df["gross_margin"] >= 0.25) &
+        (df["gross_margin_std"] <= 0.08)
+    )
+    price_mask = (
+        (df["pe"] <= max_pe) &
+        (df["ev_ebit"] <= max_ev_ebit) &
+        (df["fcf_yield"] >= min_fcfy)
+    )
+
+    df["passes_quality"] = quality_mask.fillna(False) & moat_hint.fillna(False)
+    df["passes_price"] = price_mask.fillna(False)
+    df["final_pick"] = df["passes_quality"] & df["passes_price"]
+
+    _st.subheader("Ergebnisliste")
+    show_cols = [
+        "ticker","name","sector","market_cap","price",
+        "sales_cagr","profit_cagr","roe","dte","gross_margin","gross_margin_std",
+        "pe","ev_ebit","fcf_yield",
+        "passes_quality","passes_price","final_pick"
+    ]
+    df_show = df[show_cols].copy()
+
+    _st.dataframe(df_show)
+
+    # Downloads
+    _st.download_button(
+        "📥 CSV herunterladen (alle)",
+        data=df_show.to_csv(index=False),
+        file_name="stock_screener_results.csv",
+        mime="text/csv"
+    )
+
+    _st.success(f"Total: {len(df)} | Final Picks: {int(df['final_pick'].sum())}")
 
 st.set_page_config(layout="wide")
 st.title("📊 Marktanalyse-Dashboard: Buy-/Test-Zonen & Sektorrotation")
+
+# View switch: Trading vs Investing
+view_mode = st.sidebar.radio("Modus", ["🎯 Trading", "💼 Investing"], index=0)
+if view_mode == "💼 Investing":
+    render_investing_tab()
+    st.stop()  # do not execute the Trading UI below when in Investing mode
 
 ticker = None  # move definition down
 st.sidebar.title("🔧 Einstellungen")
@@ -295,6 +456,7 @@ else:
     default_ma_buy_distance = 3
 
 ticker = st.sidebar.text_input("📈 Ticker", value="^GSPC")
+tab_chart, tab_forecast, tab_log, tab_macro, tab_mtf = st.tabs(["📈 Chart & Zonen", "🔮 Forecast", "🧾 Trading‑Log", "🌐 Makro", "🗓️ Multi‑TF Candles"])
 with st.sidebar.expander("📘 Tickerliste (Beispiele)"):
     st.markdown("""
     **Indizes**
@@ -329,6 +491,56 @@ start_date = st.sidebar.date_input("📅 Startdatum", value=pd.to_datetime("2024
 # Set default end date to tomorrow (today + 1 day), but only as default; if the user selects another date, use that.
 default_end_date = pd.to_datetime("today") + pd.Timedelta(days=1)
 end_date = st.sidebar.date_input("📅 Enddatum", value=default_end_date)
+
+# --- Historical Forecasts (from DB) in Forecast Tab ---
+with tab_forecast:
+    st.subheader("📜 Historische Forecasts (aus DB)")
+    conn_hist = sqlite3.connect(DB_PATH)
+    # Load prices from DB (falls vorhanden)
+    prices_query = """
+        SELECT date, open, high, low, close, volume
+        FROM historical_prices
+        WHERE ticker = ?
+        ORDER BY date
+    """
+    prices_df = pd.read_sql(prices_query, conn_hist, params=(ticker,))
+    prices_df['date'] = pd.to_datetime(prices_df['date'])
+
+    # Load forecasts from DB
+    forecast_query = """
+        SELECT forecast_date, forecast, upper_band, lower_band
+        FROM lstm_forecasts
+        WHERE ticker = ?
+        ORDER BY forecast_date
+    """
+    forecast_df = pd.read_sql(forecast_query, conn_hist, params=(ticker,))
+    conn_hist.close()
+    if not prices_df.empty:
+        fig_db, ax_db = plt.subplots(figsize=(12, 6))
+        ax_db.plot(prices_df['date'], prices_df['close'], label='Close Price', color='black')
+        if not forecast_df.empty:
+            forecast_df['forecast_date'] = pd.to_datetime(forecast_df['forecast_date'])
+            ax_db.plot(forecast_df['forecast_date'], forecast_df['forecast'], label='Forecast', linewidth=2)
+            ax_db.fill_between(
+                forecast_df['forecast_date'],
+                forecast_df['lower_band'],
+                forecast_df['upper_band'],
+                alpha=0.2,
+                label='Forecast Band'
+            )
+        ax_db.set_title(f"{ticker} Preis & Forecast")
+        ax_db.set_xlabel("Datum"); ax_db.set_ylabel("Preis")
+        ax_db.legend(loc='upper left')
+        st.pyplot(fig_db)
+        c1, c2 = st.columns(2)
+        with c1:
+            if st.checkbox("Historische Preisdaten anzeigen", key="show_prices_db"):
+                st.dataframe(prices_df)
+        with c2:
+            if st.checkbox("Forecast-Daten anzeigen", key="show_forecast_db"):
+                st.dataframe(forecast_df)
+    else:
+        st.info("Keine Preisdaten im DB-Cache für diesen Ticker gefunden.")
 ## Remove sliders for RSI/MA/Volume thresholds, use fixed defaults
 rsi_buy_threshold = 30
 #rsi_test_threshold = 50
@@ -347,97 +559,8 @@ with st.sidebar.expander("ℹ️ Erklärung zur Zonenprominenz"):
     **Technischer Hintergrund:** Eine Spitze zählt nur dann als relevant, wenn sie sich um mindestens die gewählte Prominenz **von benachbarten Kurswerten abhebt** (basierend auf `scipy.signal.find_peaks`).
     """)
 
-with st.sidebar.expander("🤖 Automatisches Multimarkt-LSTM-Training"):
-    st.markdown("""
-    Trainiere dein LSTM-Modell **automatisch** mit mehreren Märkten (z. B. S&P 500, Nasdaq, Dow, Russell, AAPL, MSFT, NVDA, TSLA).
 
-    Dadurch wird das Modell robuster und erkennt Muster über verschiedene Indizes und große Aktien hinweg.
-    """)
-
-    if st.button("🔄 Modell mit mehreren Märkten trainieren"):
-        st.info("📥 Lade kombinierte Daten (mehrere Indizes & Aktien)...")
-
-        tickers = ["^GSPC", "^NDX", "^DJI", "^RUT", "AAPL", "MSFT", "NVDA", "TSLA"]
-        frames = []
-
-        for ticker_symbol in tickers:
-            df = yf.download(ticker_symbol, start=start_date, end=end_date, interval="1d", auto_adjust=True)
-            if df.empty or 'Close' not in df.columns:
-                continue
-
-            df['Close_Series'] = df['Close'].squeeze()
-            df['EMA5'] = df['Close_Series'].ewm(span=5, adjust=False).mean()
-            df['MA20'] = df['Close_Series'].rolling(window=20).mean()
-            df['MA50'] = df['Close_Series'].rolling(window=50).mean()
-            df['RSI'] = RSIIndicator(close=df['Close_Series'], window=14).rsi()
-
-            vix_df = yf.download("^VIX", start=start_date, end=end_date, interval="1d", auto_adjust=True)
-            vix_df['VIX_SMA5'] = vix_df['Close'].rolling(window=5).mean()
-            vix_df['VIX_RSI'] = RSIIndicator(close=vix_df['Close'].squeeze(), window=14).rsi()
-            vix_df['VIX_Change'] = vix_df['Close'].pct_change()
-            vix_df['Month'] = vix_df.index.month / 12.0
-            vix_df = vix_df[['Close', 'VIX_SMA5', 'VIX_RSI', 'VIX_Change', 'Month']]
-            vix_df.rename(columns={'Close': 'VIX_Close'}, inplace=True)
-
-            df = df.join(vix_df, how='left')
-            df['RSI_Change'] = df['RSI'].diff()
-            df['Close_MA20_Pct'] = (df['Close_Series'] - df['MA20']) / df['MA20']
-            df['Close_EMA5_Pct'] = (df['Close_Series'] - df['EMA5']) / df['EMA5']
-            df.dropna(inplace=True)
-
-            features_df = df[['Close_Series', 'RSI', 'MA50', 'VIX_Close', 'VIX_SMA5', 'VIX_RSI',
-                              'VIX_Change', 'Month', 'RSI_Change', 'Close_MA20_Pct', 'Close_EMA5_Pct']]
-            frames.append(features_df)
-
-        if not frames:
-            st.error("❌ Keine gültigen Daten gefunden.")
-        else:
-            combined_df = pd.concat(frames, axis=0)
-            combined_df.dropna(inplace=True)
-
-            scaler = MinMaxScaler()
-            scaled_features = scaler.fit_transform(combined_df)
-
-            def create_sequences(data, seq_len=30):
-                X, y = [], []
-                for i in range(len(data) - seq_len):
-                    X.append(data[i:i + seq_len])
-                    y.append(data[i + seq_len, 0])
-                return np.array(X), np.array(y)
-
-            sequence_length = 30
-            X_seq, y_seq = create_sequences(scaled_features, sequence_length)
-            expected_shape = (sequence_length, scaled_features.shape[1])
-
-            model = Sequential()
-            model.add(LSTM(64, activation='relu', input_shape=expected_shape))
-            model.add(Dense(1))
-            model.compile(optimizer='adam', loss='mse', run_eagerly=True)
-
-            checkpoint = ModelCheckpoint("lstm_model.keras", monitor='loss', save_best_only=True, verbose=0)
-            import tensorflow as tf
-            early_stop = tf.keras.callbacks.EarlyStopping(monitor='loss', patience=5, restore_best_weights=True)
-
-            epochs = 50
-            batch_size = 16
-            progress_bar = st.progress(0)
-            status_text = st.empty()
-
-            for epoch in range(epochs):
-                model.fit(X_seq, y_seq, epochs=1, batch_size=batch_size, verbose=0, callbacks=[checkpoint, early_stop])
-                progress = (epoch + 1) / epochs
-                progress_bar.progress(progress)
-                status_text.text(f"Training... Epoche {epoch + 1}/{epochs}")
-
-            progress_bar.progress(1.0)
-            status_text.text("✅ Multimarkt-Training abgeschlossen.")
-
-
-
-# Statischer Chart
-show_static = st.sidebar.checkbox("📷 Statischen Chart anzeigen", value=False)
-
-@st.cache_data(ttl=60)  # cache expires after 10 minutes
+@st.cache_data(ttl=600)  # cache expires after 10 minutes
 def load_data(ticker, start, end, interval):
     df = yf.download(ticker, start=start, end=end, interval=interval, auto_adjust=False)
     df.dropna(inplace=True)
@@ -563,27 +686,42 @@ max_volume = max(hist_vals)
 
 # Plot: Matplotlib-Chart
 fig, ax = plt.subplots(figsize=(14, 8))
+# Set white backgrounds for figure and axes
+fig.patch.set_facecolor("white")
+ax.set_facecolor("white")
 # Y-Achsen-Skalierung optimieren: Skalenabstand auf 100 Punkte
 
 ax.yaxis.set_major_locator(MultipleLocator(100))  # Skalenabstand auf 100 Punkte setzen
 ax.plot(close_series.index, close_series.values, label='Close', linewidth=2.5, color='#00bfff')
-ax.plot(data['MA50'], label='MA50', linestyle='--', color='#ffaa00')
-ax.plot(data['MA100'], label='MA100', linestyle='--', color='brown')
-ax.plot(data['MA200'], label='MA200', linestyle='--', color='#ff0000')
+ax.plot(data['MA50'],  label='MA50',  linestyle='-', linewidth=2.0, color='#ffaa00')
+ax.plot(data['MA100'], label='MA100', linestyle='-', linewidth=2.0, color='brown')
+ax.plot(data['MA200'], label='MA200', linestyle='-', linewidth=2.2, color='#ff0000')
 
-ax.plot(data['EMA5'], label='EMA5', linestyle='--', color='#cc00cc')
-ax.plot(data['EMA9'], label='EMA9', linestyle='--', color='#ffff00')
-ax.plot(data['EMA14'], label='EMA14', linestyle='--', color='#00cc00')
-ax.plot(data['EMA69'], label='EMA69', linestyle='--', color='#9966ff')
-ax.plot(data['MA20'], label='MA20', linestyle='--', color='red')
+ax.plot(data['EMA5'],  label='EMA5',  linestyle='-', linewidth=1.8, color='#cc00cc')
+ax.plot(data['EMA9'],  label='EMA9',  linestyle='-', linewidth=1.8, color='#b8860b')
+ax.plot(data['EMA14'], label='EMA14', linestyle='-', linewidth=1.8, color='#00cc00')
+ax.plot(data['EMA69'], label='EMA69', linestyle='-', linewidth=1.8, color='#9966ff')
+ax.plot(data['MA20'],  label='MA20',  linestyle='-', linewidth=1.6, color='red')
 
-ax.plot(data['BB_upper'], label='BB Upper', linestyle='--', color='purple', alpha=0.4)
-ax.plot(data['BB_lower'], label='BB Lower', linestyle='--', color='purple', alpha=0.4)
-ax.plot(data['BB_mid'], label='BB Mid', linestyle='--', color='purple', alpha=0.3)
+ax.plot(data['BB_upper'], label='BB Upper', linestyle='-', linewidth=1.2, color='purple', alpha=0.6)
+ax.plot(data['BB_lower'], label='BB Lower', linestyle='-', linewidth=1.2, color='purple', alpha=0.6)
+ax.plot(data['BB_mid'],   label='BB Mid',   linestyle='-', linewidth=1.0, color='purple', alpha=0.5)
+
+# Legende gut lesbar – außerhalb rechts
+ax.legend(loc='center left', bbox_to_anchor=(1.01, 0.5),
+          framealpha=0.95, facecolor='white', edgecolor='#dddddd',
+          fontsize=11, ncol=1)
 
 # Signalpunkte
 ax.scatter(buy_zone.index, close_series.loc[buy_zone.index], label='Buy Zone (Signal)', marker='o', color='green', s=80)
 #ax.scatter(test_zone.index, close_series.loc[test_zone.index], label='Test Zone (Signal)', marker='x', color='red', s=80)
+
+# Set axis label and tick colors to dark for visibility
+ax.tick_params(axis='x', colors='black')
+ax.tick_params(axis='y', colors='black')
+ax.xaxis.label.set_color('black')
+ax.yaxis.label.set_color('black')
+ax.title.set_color('black')
 
 
 ## Remove all sliders for RSI, MA-Nähe, Y-Achsen-Zoom, Clustering-Schwelle und Volume-Bins
@@ -591,6 +729,110 @@ ax.scatter(buy_zone.index, close_series.loc[buy_zone.index], label='Buy Zone (Si
 
 # Replace previous slider for minimal zone score threshold with new "Konfluenz-Schwelle"
 selected_min_score = st.sidebar.slider("Konfluenz-Schwelle", 1, 3, 2)
+
+
+
+# Sidebar: Erklärung Confluence Zone
+with st.sidebar.expander("ℹ️ Erklärung: Confluence Zone"):
+    st.markdown("""
+    Eine **Confluence Zone** entsteht, wenn mehrere technische Indikatoren (z. B. Fibonacci, gleitende Durchschnitte, Volumencluster) im selben Preisbereich zusammenfallen. 
+    Diese Zonen gelten als besonders relevant für mögliche Umkehrpunkte oder Breakouts.
+    """)
+
+
+with st.sidebar.expander("🤖 Automatisches Multimarkt-LSTM-Training"):
+    st.markdown("""
+    Trainiere dein LSTM-Modell **automatisch** mit mehreren Märkten (z. B. S&P 500, Nasdaq, Dow, Russell, AAPL, MSFT, NVDA, TSLA).
+
+    Dadurch wird das Modell robuster und erkennt Muster über verschiedene Indizes und große Aktien hinweg.
+    """)
+
+    if st.button("🔄 Modell mit mehreren Märkten trainieren"):
+        st.info("📥 Lade kombinierte Daten (mehrere Indizes & Aktien)...")
+
+        tickers = ["^GSPC", "^NDX", "^DJI", "^RUT", "AAPL", "MSFT", "NVDA", "TSLA"]
+        frames = []
+
+        for ticker_symbol in tickers:
+            df = yf.download(ticker_symbol, start=start_date, end=end_date, interval="1d", auto_adjust=True)
+            if df.empty or 'Close' not in df.columns:
+                continue
+
+            df['Close_Series'] = df['Close'].squeeze()
+            df['EMA5'] = df['Close_Series'].ewm(span=5, adjust=False).mean()
+            df['MA20'] = df['Close_Series'].rolling(window=20).mean()
+            df['MA50'] = df['Close_Series'].rolling(window=50).mean()
+            df['RSI'] = RSIIndicator(close=df['Close_Series'], window=14).rsi()
+
+            vix_df = yf.download("^VIX", start=start_date, end=end_date, interval="1d", auto_adjust=True)
+            vix_df['VIX_SMA5'] = vix_df['Close'].rolling(window=5).mean()
+            vix_df['VIX_RSI'] = RSIIndicator(close=vix_df['Close'].squeeze(), window=14).rsi()
+            vix_df['VIX_Change'] = vix_df['Close'].pct_change()
+            vix_df['Month'] = vix_df.index.month / 12.0
+            vix_df = vix_df[['Close', 'VIX_SMA5', 'VIX_RSI', 'VIX_Change', 'Month']]
+            vix_df.rename(columns={'Close': 'VIX_Close'}, inplace=True)
+
+            df = df.join(vix_df, how='left')
+            df['RSI_Change'] = df['RSI'].diff()
+            df['Close_MA20_Pct'] = (df['Close_Series'] - df['MA20']) / df['MA20']
+            df['Close_EMA5_Pct'] = (df['Close_Series'] - df['EMA5']) / df['EMA5']
+            df.dropna(inplace=True)
+
+            features_df = df[['Close_Series', 'RSI', 'MA50', 'VIX_Close', 'VIX_SMA5', 'VIX_RSI',
+                              'VIX_Change', 'Month', 'RSI_Change', 'Close_MA20_Pct', 'Close_EMA5_Pct']]
+            frames.append(features_df)
+
+        if not frames:
+            st.error("❌ Keine gültigen Daten gefunden.")
+        else:
+            combined_df = pd.concat(frames, axis=0)
+            combined_df.dropna(inplace=True)
+
+            scaler = MinMaxScaler()
+            scaled_features = scaler.fit_transform(combined_df)
+
+            def create_sequences(data, seq_len=30):
+                X, y = [], []
+                for i in range(len(data) - seq_len):
+                    X.append(data[i:i + seq_len])
+                    y.append(data[i + seq_len, 0])
+                return np.array(X), np.array(y)
+
+            sequence_length = 30
+            X_seq, y_seq = create_sequences(scaled_features, sequence_length)
+            expected_shape = (sequence_length, scaled_features.shape[1])
+
+            model = Sequential()
+            model.add(LSTM(64, activation='relu', input_shape=expected_shape))
+            model.add(Dense(1))
+            model.compile(optimizer='adam', loss='mse', run_eagerly=True)
+
+            checkpoint = ModelCheckpoint("lstm_model.keras", monitor='loss', save_best_only=True, verbose=0)
+            import tensorflow as tf
+            early_stop = tf.keras.callbacks.EarlyStopping(monitor='loss', patience=5, restore_best_weights=True)
+
+            epochs = 50
+            batch_size = 16
+            progress_bar = st.progress(0)
+            status_text = st.empty()
+
+            for epoch in range(epochs):
+                model.fit(X_seq, y_seq, epochs=1, batch_size=batch_size, verbose=0, callbacks=[checkpoint, early_stop])
+                progress = (epoch + 1) / epochs
+                progress_bar.progress(progress)
+                status_text.text(f"Training... Epoche {epoch + 1}/{epochs}")
+
+            progress_bar.progress(1.0)
+            status_text.text("✅ Multimarkt-Training abgeschlossen.")
+
+
+
+# Statischer Chart
+
+#show_static = st.sidebar.checkbox("📷 Statischen Chart anzeigen", value=False)
+
+
+
 
 # --- Neue Confluence Zone Logik ---
 def is_near_fibonacci_level(price, fibs=None, tolerance=0.01):
@@ -769,31 +1011,6 @@ for lvl, val in fib.items():
 for count, edge in zip(hist_vals, bin_edges[:-1]):
     ax.barh(y=edge, width=(count / max_volume) * close_series.max() * 0.1, height=(bin_edges[1] - bin_edges[0]), alpha=0.2, color='gray')
 
-# Layout
-if show_static:
-    st.subheader("📊 Statischer Chart (für Export oder Snapshot)")
-    # Y-Achsen-Grenzen anhand der Confluence-Zonen setzen
-    if confluence_zones:
-        min_zone_price = min([zone['low'] for zone in confluence_zones])
-        max_zone_price = max([zone['high'] for zone in confluence_zones])
-        ax.set_ylim(min_zone_price - 100, max_zone_price + 100)
-    st.pyplot(fig)
-    ax.set_xlim([data.index.min(), data.index.max()])
-    ax.xaxis.set_major_locator(mdates.MonthLocator(interval=3))
-    ax.xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m'))
-    ax.set_title(f"{ticker} – Buy-/Test-Zonen mit Volumenprofil & Fibonacci", fontsize=14)
-    ax.set_xlabel("Datum")
-    ax.set_ylabel("Kurs")
-    ax.grid(True)
-    # Legende um Confluence ergänzen
-    handles, labels = ax.get_legend_handles_labels()
-    handles += custom_lines
-    labels += ['High Confluence', 'Medium Confluence', 'Low Confluence']
-    ax.legend(handles, labels)
-    fig.autofmt_xdate()
-    st.pyplot(fig)
-
-
 
 # --- Zusätzliche Makro-Charts ---
 
@@ -814,6 +1031,15 @@ def plot_jnk_spx_chart():
 
     # Plot
     fig, axs = plt.subplots(3, 1, figsize=(14, 8), gridspec_kw={'height_ratios': [1, 2.5, 1]}, sharex=True)
+    # Set white backgrounds and dark text/ticks
+    fig.patch.set_facecolor("white")
+    for ax in axs:
+        ax.set_facecolor("white")
+        ax.tick_params(axis='x', colors='black')
+        ax.tick_params(axis='y', colors='black')
+        ax.xaxis.label.set_color('black')
+        ax.yaxis.label.set_color('black')
+        ax.title.set_color('black')
 
     # RSI
     axs[0].plot(jnk.index, jnk['RSI'], color='red', label='RSI (14)')
@@ -857,6 +1083,20 @@ def plot_hyg_chart():
 
     # Plot erstellen
     fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 8), sharex=True, gridspec_kw={'height_ratios': [2, 1]})
+    # Set white backgrounds and dark text/ticks
+    fig.patch.set_facecolor("white")
+    ax1.set_facecolor("white")
+    ax2.set_facecolor("white")
+    ax1.tick_params(axis='x', colors='black')
+    ax1.tick_params(axis='y', colors='black')
+    ax2.tick_params(axis='x', colors='black')
+    ax2.tick_params(axis='y', colors='black')
+    ax1.xaxis.label.set_color('black')
+    ax1.yaxis.label.set_color('black')
+    ax2.xaxis.label.set_color('black')
+    ax2.yaxis.label.set_color('black')
+    ax1.title.set_color('black')
+    ax2.title.set_color('black')
 
     # Preisplot: HYG (linke Achse), SPX (rechte Achse)
     ax1.plot(hyg.index, hyg["Close"], label="HYG", color="green")
@@ -882,56 +1122,329 @@ def plot_hyg_chart():
     fig.tight_layout()
     st.pyplot(fig)
 
+def plot_vix_chart():
+    import yfinance as yf
+    import pandas as pd
+    import matplotlib.pyplot as plt
+    from ta.momentum import RSIIndicator
+    import streamlit as st
+
+    # Zeitraum: 2 Jahre
+    end = pd.Timestamp.today()
+    start = end - pd.DateOffset(years=2)
+
+    vix = yf.download("^VIX", start=start, end=end)
+    if vix.empty or 'Close' not in vix.columns:
+        st.warning("VIX-Daten konnten nicht geladen werden.")
+        return
+
+    vix['RSI'] = RSIIndicator(close=vix['Close'].squeeze(), window=14).rsi()
+
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 8), sharex=True, gridspec_kw={'height_ratios': [2, 1]})
+    # Set white backgrounds and dark text/ticks
+    fig.patch.set_facecolor("white")
+    ax1.set_facecolor("white")
+    ax2.set_facecolor("white")
+    ax1.tick_params(axis='x', colors='black')
+    ax1.tick_params(axis='y', colors='black')
+    ax2.tick_params(axis='x', colors='black')
+    ax2.tick_params(axis='y', colors='black')
+    ax1.xaxis.label.set_color('black')
+    ax1.yaxis.label.set_color('black')
+    ax2.xaxis.label.set_color('black')
+    ax2.yaxis.label.set_color('black')
+    ax1.title.set_color('black')
+    ax2.title.set_color('black')
+
+    # VIX Close
+    ax1.plot(vix.index, vix['Close'], label='VIX Close', color='orange')
+    ax1.set_title('VIX (2 Jahre)')
+    ax1.set_ylabel('Index Level')
+    ax1.grid(True)
+    ax1.legend(loc='upper left')
+
+    # RSI
+    ax2.plot(vix.index, vix['RSI'], label='RSI (14)', color='red')
+    ax2.axhline(70, color='gray', linestyle='--', linewidth=1)
+    ax2.axhline(30, color='gray', linestyle='--', linewidth=1)
+    ax2.set_ylabel('RSI')
+    ax2.set_title('VIX RSI')
+    ax2.grid(True)
+
+    fig.tight_layout()
+    st.pyplot(fig)
+
+
+def plot_vix_spx_comparison():
+    import yfinance as yf
+    import pandas as pd
+    import matplotlib.pyplot as plt
+    import streamlit as st
+    from ta.momentum import RSIIndicator
+
+    # Zeitraum: 2 Jahre
+    end = pd.Timestamp.today()
+    start = end - pd.DateOffset(years=2)
+
+    vix = yf.download("^VIX", start=start, end=end)
+    spx = yf.download("^GSPC", start=start, end=end)
+
+    if vix.empty or spx.empty:
+        st.warning("VIX/SPX Daten konnten nicht geladen werden.")
+        return
+
+    # Normiere SPX für vergleichbare Skala (0..1)
+    spx_norm = (spx['Close'] - spx['Close'].min()) / (spx['Close'].max() - spx['Close'].min())
+    # Optional: RSI von VIX als Stimmungsindikator
+    vix_rsi = RSIIndicator(close=vix['Close'].squeeze(), window=14).rsi()
+
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 8), sharex=True, gridspec_kw={'height_ratios':[2,1]})
+    # Set white backgrounds and dark text/ticks
+    fig.patch.set_facecolor("white")
+    ax1.set_facecolor("white")
+    ax2.set_facecolor("white")
+    ax1.tick_params(axis='x', colors='black')
+    ax1.tick_params(axis='y', colors='black')
+    ax2.tick_params(axis='x', colors='black')
+    ax2.tick_params(axis='y', colors='black')
+    ax1.xaxis.label.set_color('black')
+    ax1.yaxis.label.set_color('black')
+    ax2.xaxis.label.set_color('black')
+    ax2.yaxis.label.set_color('black')
+    ax1.title.set_color('black')
+    ax2.title.set_color('black')
+
+    # VIX und normierter SPX (sekundäre Achse vermeiden: gleiches 0..1 Maßstab für SPX)
+    ax1.plot(vix.index, vix['Close'], label='VIX Close', color='orange')
+    ax1b = ax1.twinx()
+    ax1b.plot(spx.index, spx_norm, label='SPX (normiert 0–1)', color='blue', alpha=0.6)
+    ax1.set_title('VIX vs. S&P 500 (2 Jahre)')
+    ax1.set_ylabel('VIX')
+    ax1b.set_ylabel('SPX (normiert)')
+    ax1.grid(True)
+    ax1.legend(loc='upper left')
+    ax1b.legend(loc='upper right')
+
+    # VIX RSI unten
+    ax2.plot(vix.index, vix_rsi, label='VIX RSI (14)', color='red')
+    ax2.axhline(70, color='gray', linestyle='--', linewidth=1)
+    ax2.axhline(30, color='gray', linestyle='--', linewidth=1)
+    ax2.set_ylabel('RSI')
+    ax2.set_title('VIX RSI')
+    ax2.grid(True)
+
+    fig.tight_layout()
+    st.pyplot(fig)
+
+
+## Removed plot_vix_seasonality and replaced with static image display in Macro tab below
+
+
+with tab_macro:
+    st.subheader("🌐 Makro – Zusatzcharts")
+
+    st.markdown("### JNK vs SPX (inkl. RSI)")
+    plot_jnk_spx_chart()
+
+    st.markdown("### HYG vs SPX (2 Jahre)")
+    plot_hyg_chart()
+
+    st.markdown("### VIX Chart")
+    plot_vix_chart()
+
+    st.markdown("### VIX vs S&P 500")
+    plot_vix_spx_comparison()
+
+    # Display S&P 500 and VIX seasonality images in Macro tab
+    st.subheader("📊 S&P 500 Seasonality")
+    sp500_image_path = os.path.join("images", "S&P500Seasonality.png")
+    if os.path.exists(sp500_image_path):
+        st.image(sp500_image_path, use_container_width=True)
+    else:
+        st.warning("S&P 500 Seasonality image not found.")
+
+    st.subheader("📊 VIX Seasonality")
+    vix_image_path = os.path.join("images", "vix_seasonality.png")
+    if os.path.exists(vix_image_path):
+        st.image(vix_image_path, use_container_width=True)
+    else:
+        st.warning("VIX Seasonality image not found.")
+
+
+# --- New: Multi‑TF Candles (D/W/M/Q) with BB(20,2) and EMA(5) ---
+import plotly.graph_objects as go
+from ta.volatility import BollingerBands as _BB
+
+def _prep_tf_df(symbol: str, interval: str, years: int = 12):
+    end = pd.Timestamp.today()
+    start = end - pd.DateOffset(years=years)
+    df = yf.download(symbol, start=start, end=end, interval=interval, auto_adjust=False)
+    if df.empty:
+        return df
+    # Ensure simple columns
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = df.columns.get_level_values(0)
+    df.dropna(inplace=True)
+    close = df['Close'].squeeze()
+    # EMA(5) on this timeframe
+    df['EMA5'] = close.ewm(span=5, adjust=False).mean()
+    # Bollinger Bands 20, 2
+    bb = _BB(close=close, window=20, window_dev=2)
+    df['BB_MID'] = bb.bollinger_mavg()
+    df['BB_UP'] = bb.bollinger_hband()
+    df['BB_LO'] = bb.bollinger_lband()
+    return df
+
+def _make_tf_figure(df: pd.DataFrame, title: str):
+    fig = go.Figure()
+
+    # Candles with strong contrast
+    fig.add_trace(go.Candlestick(
+        x=df.index,
+        open=df['Open'], high=df['High'], low=df['Low'], close=df['Close'],
+        increasing_line_color='rgb(0,160,0)',
+        decreasing_line_color='rgb(200,0,0)',
+        name='Candles'
+    ))
+
+    # EMA(5)
+    fig.add_trace(go.Scatter(
+        x=df.index, y=df['EMA5'],
+        name='EMA(5)',
+        mode='lines',
+        line=dict(width=2.2)
+    ))
+
+    # Bollinger Bands (dashed lines + light fill)
+    fig.add_trace(go.Scatter(
+        x=df.index, y=df['BB_UP'],
+        name='BB Upper',
+        mode='lines',
+        line=dict(dash='dash', width=1.4)
+    ))
+    fig.add_trace(go.Scatter(
+        x=df.index, y=df['BB_MID'],
+        name='BB Mid',
+        mode='lines',
+        line=dict(dash='dash', width=1.0)
+    ))
+    fig.add_trace(go.Scatter(
+        x=df.index, y=df['BB_LO'],
+        name='BB Lower',
+        mode='lines',
+        line=dict(dash='dash', width=1.4),
+        fill='tonexty',
+        fillcolor='rgba(80,120,200,0.12)'
+    ))
+
+    # Layout: high contrast white theme
+    fig.update_layout(
+        template='plotly_white',
+        title=title,
+        height=520,
+        margin=dict(l=60, r=60, t=60, b=50),
+        plot_bgcolor="white",
+        paper_bgcolor="white",
+        font=dict(color="black", size=12),
+        legend=dict(
+            bgcolor='rgba(255,255,255,0.95)',
+            bordercolor='#cfcfcf',
+            borderwidth=1,
+            orientation='h',
+            x=0, y=1.05
+        ),
+        hovermode="x unified",
+    )
+    fig.update_xaxes(
+        showgrid=True, gridcolor='#d9d9d9',
+        showline=True, linewidth=1, linecolor='#555'
+    )
+    fig.update_yaxes(
+        showgrid=True, gridcolor='#d9d9d9',
+        showline=True, linewidth=1, linecolor='#555'
+    )
+    return fig
+
+def render_multi_tf_candles(symbol: str):
+    # Daily, Weekly, Monthly, Quarterly (approx via 3mo)
+    d = _prep_tf_df(symbol, '1d', years=3)
+    w = _prep_tf_df(symbol, '1wk', years=8)
+    m = _prep_tf_df(symbol, '1mo', years=12)
+    q = _prep_tf_df(symbol, '3mo', years=15)
+
+    if d.empty and w.empty and m.empty and q.empty:
+        st.warning("Keine Daten für die Multi‑TF‑Ansicht gefunden.")
+        return
+
+    if not d.empty:
+        st.markdown("### Daily")
+        st.plotly_chart(_make_tf_figure(d, f"{symbol} – Daily Candles, BB(20,2), EMA(5)"), use_container_width=True)
+    if not w.empty:
+        st.markdown("### Weekly")
+        st.plotly_chart(_make_tf_figure(w, f"{symbol} – Weekly Candles, BB(20,2), EMA(5)"), use_container_width=True)
+    if not m.empty:
+        st.markdown("### Monthly")
+        st.plotly_chart(_make_tf_figure(m, f"{symbol} – Monthly Candles, BB(20,2), EMA(5)"), use_container_width=True)
+    if not q.empty:
+        st.markdown("### Quarterly")
+        st.plotly_chart(_make_tf_figure(q, f"{symbol} – Quarterly Candles, BB(20,2), EMA(5)"), use_container_width=True)
+
+
+# --- Multi‑TF Tab ---
+with tab_mtf:
+    st.subheader("🗓️ Multi‑TF Candles: Daily / Weekly / Monthly / Quarterly")
+    render_multi_tf_candles(ticker)
 
 
 
 # 🟢 Marktampel
-st.subheader("🚦Marktampel – Überblick")
-# Sicheres Auslesen des letzten RSI-Werts
-if not data.empty and 'RSI' in data.columns and not data['RSI'].dropna().empty:
-    last_rsi = round(data['RSI'].dropna().iloc[-1], 1)
-else:
-    last_rsi = None
-# Sicheres Auslesen der letzten MA50-Werte für die Steigungsberechnung
-if not data.empty and 'MA50' in data.columns and len(data['MA50'].dropna()) >= 5:
-    ma_slope = data['MA50'].dropna().iloc[-1] - data['MA50'].dropna().iloc[-5]
-else:
-    ma_slope = 0
-
-# 5-stufige Ampellogik mit klarer Differenzierung
-if last_rsi is not None:
-    if last_rsi > 65 and ma_slope > 0.5:
-        ampel = "🟢 Sehr bullisch"
-    elif last_rsi > 55 and ma_slope > 0:
-        ampel = "🟢 Bullisch"
-    elif last_rsi > 45:
-        ampel = "🟡 Neutral"
-    elif last_rsi > 35 or ma_slope < 0:
-        ampel = "🟠 Schwach"
+with tab_chart:
+    st.subheader("🚦Marktampel – Überblick")
+    # Sicheres Auslesen des letzten RSI-Werts
+    if not data.empty and 'RSI' in data.columns and not data['RSI'].dropna().empty:
+        last_rsi = round(data['RSI'].dropna().iloc[-1], 1)
     else:
-        ampel = "🔴 Sehr schwach"
-else:
-    ampel = "⚫ Kein RSI verfügbar"
+        last_rsi = None
+    # Sicheres Auslesen der letzten MA50-Werte für die Steigungsberechnung
+    if not data.empty and 'MA50' in data.columns and len(data['MA50'].dropna()) >= 5:
+        ma_slope = data['MA50'].dropna().iloc[-1] - data['MA50'].dropna().iloc[-5]
+    else:
+        ma_slope = 0
 
-# Metriken anzeigen
-st.metric(label="RSI (Letzte Woche)", value=f"{last_rsi}")
-st.metric(label="MA50 Trend (5 Wochen)", value=f"{ma_slope:.1f}")
+    # 5-stufige Ampellogik mit klarer Differenzierung
+    if last_rsi is not None:
+        if last_rsi > 65 and ma_slope > 0.5:
+            ampel = "🟢 Sehr bullisch"
+        elif last_rsi > 55 and ma_slope > 0:
+            ampel = "🟢 Bullisch"
+        elif last_rsi > 45:
+            ampel = "🟡 Neutral"
+        elif last_rsi > 35 or ma_slope < 0:
+            ampel = "🟠 Schwach"
+        else:
+            ampel = "🔴 Sehr schwach"
+    else:
+        ampel = "⚫ Kein RSI verfügbar"
+
+    # Metriken anzeigen
+    st.metric(label="RSI (Letzte Woche)", value=f"{last_rsi}")
+    st.metric(label="MA50 Trend (5 Wochen)", value=f"{ma_slope:.1f}")
 
 
-# Ampelbeschreibung
-st.markdown(f"**Marktampel:** {ampel}")
-with st.expander("ℹ️ Erläuterung zur Marktampel"):
-    st.markdown("""
-    Die Marktampel bewertet die aktuelle Marktlage basierend auf dem RSI (Relative Strength Index) sowie dem Trendverlauf des MA50:
+    # Ampelbeschreibung
+    st.markdown(f"**Marktampel:** {ampel}")
+    with st.expander("ℹ️ Erläuterung zur Marktampel"):
+        st.markdown("""
+        Die Marktampel bewertet die aktuelle Marktlage basierend auf dem RSI (Relative Strength Index) sowie dem Trendverlauf des MA50:
 
-    - 🟢 **Sehr bullisch**: RSI &gt; 65 und MA50-Trend deutlich steigend
-    - 🟢 **Bullisch**: RSI &gt; 55 und MA50-Trend positiv
-    - 🟡 **Neutral**: RSI zwischen 45 und 55
-    - 🟠 **Schwach**: RSI unter 45 oder fallender MA50-Trend
-    - 🔴 **Sehr schwach**: RSI unter 35 und klar negativer MA50-Trend
+        - 🟢 **Sehr bullisch**: RSI &gt; 65 und MA50-Trend deutlich steigend
+        - 🟢 **Bullisch**: RSI &gt; 55 und MA50-Trend positiv
+        - 🟡 **Neutral**: RSI zwischen 45 und 55
+        - 🟠 **Schwach**: RSI unter 45 oder fallender MA50-Trend
+        - 🔴 **Sehr schwach**: RSI unter 35 und klar negativer MA50-Trend
 
-    Diese Einschätzung hilft bei der groben Einordnung des Marktumfelds, ersetzt aber keine eigene Analyse.
-    """)
+        Diese Einschätzung hilft bei der groben Einordnung des Marktumfelds, ersetzt aber keine eigene Analyse.
+        """)
 
 # 📥 CSV-Export
 export_df = pd.DataFrame({
@@ -970,20 +1483,26 @@ fig3 = make_subplots(
 fig3.update_layout(height=1200)
 
 # Bedingte Anzeige der Indikatoren (alle in row=1, col=1)
+# Bedingte Anzeige der Indikatoren (alle in row=1, col=1)
 if show_indicators:
-    fig3.add_trace(go.Scatter(x=plot_df.index, y=plot_df['MA50'], name='MA50', line=dict(dash='dot', color='orange')), row=1, col=1)
-    fig3.add_trace(go.Scatter(x=plot_df.index, y=plot_df['MA200'], name='MA200', line=dict(dash='dot', color='orange')), row=1, col=1)
-    fig3.add_trace(go.Scatter(x=plot_df.index, y=plot_df['EMA5'], name='EMA5', line=dict(dash='dot', color='blueviolet')), row=1, col=1)
-    fig3.add_trace(go.Scatter(x=plot_df.index, y=plot_df['EMA9'], name='EMA9', line=dict(dash='dot', color='yellow')), row=1, col=1)
-    fig3.add_trace(go.Scatter(x=plot_df.index, y=plot_df['EMA14'], name='EMA14', line=dict(dash='dot', color='green')), row=1, col=1)
-    fig3.add_trace(go.Scatter(x=plot_df.index, y=plot_df['EMA69'], name='EMA69', line=dict(dash='dot', color='magenta')), row=1, col=1)
-    fig3.add_trace(go.Scatter(x=plot_df.index, y=plot_df['EMA_5W'], name='Weekly EMA(5)', line=dict(dash='dot', color='gray')), row=1, col=1)
-    fig3.add_trace(go.Scatter(x=plot_df.index, y=plot_df['EMA_5Y'], name='Yearly EMA(5)', line=dict(dash='dash', color='gray')), row=1, col=1)
-    fig3.add_trace(go.Scatter(x=plot_df.index, y=plot_df['MA20'], name='MA20', line=dict(dash='dot', color='red')), row=1, col=1)
-    fig3.add_trace(go.Scatter(x=plot_df.index, y=plot_df['MA100'], name='MA100', line=dict(dash='dot', color='brown')), row=1, col=1)
-    fig3.add_trace(go.Scatter(x=plot_df.index, y=plot_df['BB_upper'], name='BB Upper', line=dict(dash='dot', color='purple'), opacity=0.6), row=1, col=1)
-    fig3.add_trace(go.Scatter(x=plot_df.index, y=plot_df['BB_lower'], name='BB Lower', line=dict(dash='dot', color='purple'), opacity=0.6), row=1, col=1)
-    fig3.add_trace(go.Scatter(x=plot_df.index, y=plot_df['BB_mid'], name='BB Mid', line=dict(dash='dot', color='violet'), opacity=0.4), row=1, col=1)
+    fig3.add_trace(go.Scatter(x=plot_df.index, y=plot_df['MA50'],  name='MA50',  line=dict(color='orange',   width=2.0)), row=1, col=1)
+    fig3.add_trace(go.Scatter(x=plot_df.index, y=plot_df['MA200'], name='MA200', line=dict(color='red',      width=2.2)), row=1, col=1)
+
+    fig3.add_trace(go.Scatter(x=plot_df.index, y=plot_df['EMA5'],  name='EMA(5)',   line=dict(color='blueviolet', width=1.8)), row=1, col=1)
+    fig3.add_trace(go.Scatter(x=plot_df.index, y=plot_df['EMA9'],  name='EMA(9)',   line=dict(color='goldenrod',  width=1.8)), row=1, col=1)
+    fig3.add_trace(go.Scatter(x=plot_df.index, y=plot_df['EMA14'], name='EMA(14)',  line=dict(color='green',      width=1.8)), row=1, col=1)
+    fig3.add_trace(go.Scatter(x=plot_df.index, y=plot_df['EMA69'], name='EMA(69)',  line=dict(color='magenta',    width=1.8)), row=1, col=1)
+
+    fig3.add_trace(go.Scatter(x=plot_df.index, y=plot_df['EMA_5W'], name='Weekly EMA(5)', line=dict(color='gray', width=1.5)), row=1, col=1)
+    fig3.add_trace(go.Scatter(x=plot_df.index, y=plot_df['EMA_5Y'], name='Yearly EMA(5)', line=dict(color='gray', width=1.5), showlegend=False), row=1, col=1)
+
+    fig3.add_trace(go.Scatter(x=plot_df.index, y=plot_df['MA20'],  name='MA20',  line=dict(color='red',   width=1.6)), row=1, col=1)
+    fig3.add_trace(go.Scatter(x=plot_df.index, y=plot_df['MA100'], name='MA100', line=dict(color='brown', width=1.8)), row=1, col=1)
+
+    # Bollinger Bands – nur 1 Legendeneintrag
+    fig3.add_trace(go.Scatter(x=plot_df.index, y=plot_df['BB_upper'], name='Bollinger Bands', line=dict(color='purple', width=1.4), opacity=0.7), row=1, col=1)
+    fig3.add_trace(go.Scatter(x=plot_df.index, y=plot_df['BB_lower'], showlegend=False,       line=dict(color='purple', width=1.4), opacity=0.7), row=1, col=1)
+    fig3.add_trace(go.Scatter(x=plot_df.index, y=plot_df['BB_mid'],   showlegend=False,       line=dict(color='violet', width=1.0),  opacity=0.5), row=1, col=1)
 
 # # Bedingte Anzeige der Buy/Test Signale (row=1, col=1)
 # if show_signals:
@@ -1151,40 +1670,48 @@ def add_bb_breakouts(fig, df, name_prefix="BB Breakout"):
                                      name=f"{name_prefix} Below"))
 # Hintergrund & Grid anpassen (TradingView-Style) für beide Subplots
 fig3.update_layout(
-    plot_bgcolor='#131722',
-    paper_bgcolor='#131722',
-    font=dict(color='#dedede'),
+    plot_bgcolor="white",
+    paper_bgcolor="white",
+    font=dict(color="black"),
     hovermode="x unified",
     title=dict(
         text=f"{ticker} – Interaktiver Chart",
         x=0.5, xanchor='center',
-        font=dict(size=16, color='#ffffff')
+        font=dict(size=16, color='black')
     ),
-    height=1200
+    height=1200,
+    margin=dict(l=60, r=180, t=80, b=60),
+    legend=dict(
+        bgcolor='rgba(255,255,255,0.95)',
+        bordercolor='gray', borderwidth=1,
+        font=dict(size=12),
+        x=1.02, xanchor='left', y=1.0,
+        orientation='v', itemsizing='trace'
+    )
 )
 fig3.update_xaxes(
-    gridcolor='#2a2e39',
-    showline=True, linewidth=1, linecolor='#666666',
-    showspikes=True, spikecolor="white", spikethickness=1, spikedash='dot',
+    gridcolor='#e6e6e6',
+    showline=True, linewidth=1, linecolor='#999999',
+    showspikes=True, spikecolor='black', spikethickness=1, spikedash='dot',
     rangeslider_visible=False,
     row=1, col=1
 )
 fig3.update_xaxes(
-    gridcolor='#2a2e39',
-    showline=True, linewidth=1, linecolor='#666666',
-    showspikes=True, spikecolor="white", spikethickness=1, spikedash='dot',
+    gridcolor='#e6e6e6',
+    showline=True, linewidth=1, linecolor='#999999',
+    showspikes=True, spikecolor='black', spikethickness=1, spikedash='dot',
     rangeslider_visible=False,
     row=2, col=1
 )
 fig3.update_yaxes(
-    gridcolor='#2a2e39',
+    gridcolor='#e6e6e6',
     showline=True, linewidth=1, linecolor='#666666',
-    showspikes=True, spikecolor="white", spikethickness=1, spikedash='dot',
+    showspikes=True, spikecolor="black", spikethickness=1, spikedash='dot',
     title_text="Preis",
     row=1, col=1
 )
 fig3.update_yaxes(
-    gridcolor='#2a2e39',
+    gridcolor='#e6e6e6',
     showline=True, linewidth=1, linecolor='#666666',
     title_text="RSI",
     range=[0, 100],
@@ -1213,15 +1740,15 @@ for zone in confluence_zones:
         y=zone['level'],
         text=f"{zone['score']}/3",
         showarrow=False,
-        font=dict(size=12, color='white'),
-        bgcolor='rgba(0,0,0,0.6)',
+        font=dict(size=12, color='black'),
+        bgcolor='rgba(255,255,255,0.9)',
         bordercolor='gray',
         borderwidth=1,
         xanchor='left',
         row=1, col=1
     )
 
-# ==== RSI Subplot in row=2, col=1 ====
+rsi_series = data['RSI'].dropna()
 rsi_series = data['RSI'].dropna()
 fig3.add_trace(
     go.Scatter(x=rsi_series.index, y=rsi_series, name='RSI (14)', line=dict(color='deepskyblue', width=2)),
@@ -1289,8 +1816,8 @@ if vereinfachte_trading:
             y=zone['level'],
             text=f"{zone['score']}/3",
             showarrow=False,
-            font=dict(size=10, color='white'),
-            bgcolor='rgba(0,0,0,0.6)',
+            font=dict(size=10, color='black'),
+            bgcolor='rgba(255,255,255,0.9)',
             bordercolor='gray',
             borderwidth=1,
             xanchor='left',
@@ -1312,8 +1839,8 @@ if vereinfachte_trading:
                 y=val,
                 text=f"Fib {lvl}",
                 showarrow=False,
-                font=dict(size=12, color='#aaaaaa'),
-                bgcolor='rgba(0,0,0,0.2)',
+                font=dict(size=12, color='#444444'),
+                bgcolor='rgba(255,255,255,0.85)',
                 bordercolor='#555555',
                 borderwidth=1,
                 xanchor='right',
@@ -1330,33 +1857,33 @@ if vereinfachte_trading:
     fig3.add_hline(y=float(30), line=dict(color='gray', dash='dash'), row=2, col=1)
     # Layout
     fig3.update_layout(
-        plot_bgcolor='#131722',
-        paper_bgcolor='#131722',
-        font=dict(color='#dedede'),
+        plot_bgcolor="white",
+        paper_bgcolor="white",
+        font=dict(color="black"),
         hovermode="x unified",
         title=dict(
             text=f"{ticker} – Vereinfachte Trading-Ansicht",
             x=0.5, xanchor='center',
-            font=dict(size=16, color='#ffffff')
+            font=dict(size=16, color='black')
         ),
         height=900
     )
     fig3.update_xaxes(
-        gridcolor='#2a2e39',
+        gridcolor='#e6e6e6',
         showline=True, linewidth=1, linecolor='#666666',
-        showspikes=True, spikecolor="white", spikethickness=1, spikedash='dot',
+        showspikes=True, spikecolor="black", spikethickness=1, spikedash='dot',
         rangeslider_visible=False,
         row=1, col=1
     )
     fig3.update_yaxes(
-        gridcolor='#2a2e39',
+        gridcolor='#e6e6e6',
         showline=True, linewidth=1, linecolor='#666666',
-        showspikes=True, spikecolor="white", spikethickness=1, spikedash='dot',
+        showspikes=True, spikecolor="black", spikethickness=1, spikedash='dot',
         title_text="Preis",
         row=1, col=1
     )
     fig3.update_yaxes(
-        gridcolor='#2a2e39',
+        gridcolor='#e6e6e6',
         showline=True, linewidth=1, linecolor='#666666',
         title_text="RSI",
         range=[0, 100],
@@ -1448,8 +1975,8 @@ else:
             y=val,
             text=f"Fib {lvl}",
             showarrow=False,
-            font=dict(size=12, color='#aaaaaa'),
-            bgcolor='rgba(0,0,0,0.2)',
+            font=dict(size=12, color='#444444'),
+            bgcolor='rgba(255,255,255,0.85)',
             bordercolor='#555555',
             borderwidth=1,
             xanchor='right'
@@ -1478,8 +2005,9 @@ zones_table_df = pd.DataFrame([{
 } for zone in confluence_zones])
 
 # Tabelle anzeigen (automatisch aktualisiert mit Prominenz-Slider)
-st.subheader("📄 Übersicht der Confluence Zonen")
-st.dataframe(zones_table_df)
+with tab_chart:
+    st.subheader("📄 Übersicht der Confluence Zonen")
+    st.dataframe(zones_table_df)
 
 # Zonen als Rechtecke (Shapes) in Plotly-Chart
 for zone in confluence_zones:
@@ -1501,8 +2029,8 @@ for zone in confluence_zones:
         y=zone["mid"],
         text=label,
         showarrow=False,
-        font=dict(size=12, color="white"),
-        bgcolor="rgba(0,0,0,0.6)",
+        font=dict(size=12, color="black"),
+        bgcolor="rgba(255,255,255,0.9)",
         bordercolor="gray",
         borderwidth=1,
         xanchor="left"
@@ -1669,12 +2197,59 @@ if show_lstm:
     fig3.add_trace(lower_trace)
     fig3.add_trace(forecast_trace)
 
-st.plotly_chart(fig3, use_container_width=True)
+
+with tab_chart:
+    st.plotly_chart(fig3, use_container_width=True)
 
 
-# Legende als Expander statt im Chart
-with st.expander("Legende"):
-    st.markdown("""
+
+with tab_log:
+    st.subheader("🧾 Trading‑Log – Eintrag hinzufügen")
+    col1, col2, col3 = st.columns([1,1,1])
+    with col1:
+        trade_date = st.date_input("Datum", value=pd.to_datetime("today"), key="trade_date_tab_form")
+    with col2:
+        trade_product = st.text_input("Produkt (z.B. AAPL)", value="", key="trade_product_tab_form")
+    with col3:
+        trade_pnl = st.number_input("P&L (USD)", step=0.01, key="trade_pnl_tab_form")
+    if st.button("➕ Eintrag speichern", key="save_trade_tab_form"):
+        upsert_trading_result(trade_date, trade_product, trade_pnl)
+        st.success(f"{trade_date}: {trade_product} {trade_pnl:+.2f} USD gespeichert")
+    # --- Trading-Ergebnisse aus der DB laden und nach Datum sortieren ---
+    df_trades = load_trading_results()  # erwartet Spalten: trade_date, product, pnl
+
+    if not df_trades.empty:
+        df_trades["trade_date"] = pd.to_datetime(df_trades["trade_date"])
+        df_trades.sort_values("trade_date", ascending=True, inplace=True)
+
+        # Wöchentliche und monatliche P&L-Gruppierung
+        df_trades["week_start"] = df_trades["trade_date"].dt.to_period("W").apply(lambda r: r.start_time)
+        df_trades["month_start"] = df_trades["trade_date"].dt.to_period("M").apply(lambda r: r.start_time)
+        weekly = df_trades.groupby("week_start").agg(total_pnl=("pnl","sum")).reset_index()
+        monthly = df_trades.groupby("month_start").agg(total_pnl=("pnl","sum")).reset_index()
+
+        # Produkt-Performance
+        by_product = df_trades.groupby("product").agg(
+            total_pnl=("pnl","sum"),
+            trades_count=("pnl","count"),
+            win_rate=("pnl", lambda x: (x>0).mean())
+        ).reset_index()
+
+        # Anzeige der Zusammenfassungen
+        st.subheader("📈 Trading Performance Übersicht")
+        st.write("**Wöchentliche P&L**")
+        st.bar_chart(weekly.rename(columns={"week_start":"index"}).set_index("index")["total_pnl"])
+        st.write("**Monatliche P&L**")
+        st.bar_chart(monthly.rename(columns={"month_start":"index"}).set_index("index")["total_pnl"])
+        st.write("**Performance nach Produkt**")
+        st.dataframe(by_product)
+    else:
+        st.info("Noch keine Trading‑Einträge vorhanden.")
+
+
+with tab_chart:
+    with st.expander("Legende"):
+        st.markdown("""
 **Linien & Farben**
 - **MA50**: dunkelblau (Durchschnitt der letzten 50 Perioden)
 - **EMA20**: violett (Exponentieller Durchschnitt, 20 Perioden)
@@ -1694,10 +2269,10 @@ with st.expander("Legende"):
 **Signale**
 - **Grüne Punkte**: Buy-Signal (Kombination aus RSI/MA)
 - **Rote Punkte**: Test-Signal (Kombination aus RSI/MA)
-    """)
+        """)
 
-with st.expander("🧠 Erklärung: Confluence Zones"):
-    st.markdown("""
+    with st.expander("🧠 Erklärung: Confluence Zones"):
+        st.markdown("""
     Die **Confluence Zones** markieren Preisbereiche, an denen mehrere wichtige Faktoren zusammentreffen. Je höher der Score (maximal 3), desto mehr Argumente sprechen für die Relevanz dieser Zone.
 
     **Bewertungskriterien (je 1 Punkt):**
@@ -1709,217 +2284,4 @@ with st.expander("🧠 Erklärung: Confluence Zones"):
     - **Score 3/3:** Sehr starke Konfluenz – mehrere wichtige Faktoren treffen zusammen.
     - **Score 2/3:** Mittlere Konfluenz – mindestens zwei Faktoren stimmen überein.
     - **Score 1/3:** Leichte Konfluenz – nur ein Faktor spricht für diese Zone.
-
-    Nur Zonen mit Score ≥ der gewählten Konfluenz-Schwelle werden angezeigt.
-    """)
-
-# 📊 Zusätzliche Makro-Charts
-
-def plot_bpspx_chart():
-    st.subheader("SPXA200R (Prozent der S&P 500 Aktien über dem 200-Tage-MA) mit RSI")
-    try:
-        bpspx = yf.download("^SPXA200R", start="2023-01-01", interval="1d")
-        if bpspx.empty:
-            st.warning("Keine SPXA200R-Daten verfügbar.")
-            return
-
-        bpspx["RSI"] = RSIIndicator(close=bpspx["Close"]).rsi()
-
-        fig, ax1 = plt.subplots(figsize=(12, 5))
-        ax1.set_title("SPXA200R mit RSI", fontsize=16)
-        ax1.plot(bpspx.index, bpspx["Close"], label="SPXA200R", color="tab:blue")
-        ax1.set_ylabel("SPXA200R", color="tab:blue")
-        ax1.tick_params(axis="y", labelcolor="tab:blue")
-
-        ax2 = ax1.twinx()
-        ax2.plot(bpspx.index, bpspx["RSI"], label="RSI", color="tab:red", alpha=0.5)
-        ax2.set_ylabel("RSI", color="tab:red")
-        ax2.tick_params(axis="y", labelcolor="tab:red")
-
-        fig.tight_layout()
-        st.pyplot(fig)
-
-    except Exception as e:
-        st.error(f"Fehler beim Laden der SPXA200R-Daten: {e}")
-
-# Expander für Makro-Charts mit neuen Checkboxen
-with st.expander("📊 Zusätzliche Makro-Charts"):
-    show_jnk_detail_chart = st.checkbox("JNK Detailchart anzeigen", value=True)
-    show_hyg_vs_spx = st.checkbox("HYG vs SPX anzeigen", value=True)
-    show_vix_vs_spx = st.checkbox("VIX vs SPX anzeigen", value=True)
-    show_spx_ma = st.checkbox("SPX Monthly MAs anzeigen", value=True)
-    #show_spxa200r = st.checkbox("SPXA200R anzeigen", value=True)
-    show_vix_seasonality = st.checkbox("VIX Saisonalität anzeigen", value=True)
-    show_SP500_seasonality = st.checkbox("S&P500 Saisonalität anzeigen", value=True)
-    show_sp500_pe_ratio = st.checkbox("S&P500 PE Ratio anzeigen", value=True)
-
-    # JNK Detailchart anzeigen
-    if show_jnk_detail_chart:
-        start_date = "2023-06-01"
-        end_date = "2025-06-27"
-
-        jnk = yf.download("JNK", start=start_date, end=end_date)
-        spx = yf.download("^GSPC", start=start_date, end=end_date)
-
-        if not jnk.empty and not spx.empty:
-            rsi_jnk = RSIIndicator(close=jnk["Close"].squeeze(), window=14).rsi()
-
-            fig, axs = plt.subplots(3, 1, figsize=(14, 9), sharex=True, gridspec_kw={"height_ratios": [1, 2, 2]})
-            fig.suptitle("JNK vs SPX mit RSI (Detailansicht)", fontsize=16)
-
-            axs[0].plot(jnk.index, rsi_jnk, color='red', label='RSI (14)')
-            axs[0].axhline(70, color='gray', linestyle='--', linewidth=1)
-            axs[0].axhline(30, color='gray', linestyle='--', linewidth=1)
-            axs[0].axhline(50, color='gray', linestyle=':', linewidth=1)
-            axs[0].set_ylabel("RSI")
-            axs[0].legend(loc="upper left")
-            axs[0].grid(True)
-
-            axs[1].plot(jnk.index, jnk["Close"], color='green', label='JNK Close')
-            axs[1].set_ylabel("JNK")
-            axs[1].legend(loc="upper left")
-            axs[1].grid(True)
-
-            axs[2].plot(spx.index, spx["Close"], color='deepskyblue', label='SPX Close')
-            axs[2].set_ylabel("SPX")
-            axs[2].legend(loc="upper left")
-            axs[2].grid(True)
-
-            axs[2].xaxis.set_major_locator(mdates.MonthLocator(interval=2))
-            axs[2].xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m'))
-            plt.xticks(rotation=45)
-
-            plt.tight_layout(rect=[0, 0.03, 1, 0.97])
-            st.pyplot(fig)
-
-# Ensure all charts can be shown independently
-#if 'show_junk' in locals() and show_jnk_detail_chart:
- #   plot_jnk_spx_chart()
-    if 'show_hyg_vs_spx' in locals() and show_hyg_vs_spx:
-        plot_hyg_chart()
-    # VIX vs SPX Chart mit RSI
-    if show_vix_vs_spx:
-        vix = yf.download("^VIX", start=start_date, end=end_date)
-        spx = yf.download("^GSPC", start=start_date, end=end_date)
-
-        vix_close = vix["Close"]
-        spx_close = spx["Close"]
-
-        rsi_vix = RSIIndicator(close=vix_close.squeeze(), window=14).rsi()
-
-        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 8), sharex=True)
-
-        ax1.plot(vix_close, label='VIX', color='black')
-        ax1.set_ylabel("VIX", color='black')
-        ax1.tick_params(axis='y', labelcolor='black')
-        ax1.legend(loc="upper left")
-
-        ax1_2 = ax1.twinx()
-        ax1_2.plot(spx_close, label='SPX', color='blue', alpha=0.6)
-        ax1_2.set_ylabel("SPX", color='blue')
-        ax1_2.tick_params(axis='y', labelcolor='blue')
-        ax1_2.legend(loc="upper right")
-        ax1.set_title("VIX vs SPX")
-
-        ax2.plot(rsi_vix, label="VIX RSI", color='red')
-        ax2.axhline(70, linestyle='--', color='gray')
-        ax2.axhline(30, linestyle='--', color='gray')
-        ax2.set_ylabel("RSI")
-        ax2.set_title("VIX RSI")
-        ax2.legend()
-
-        st.pyplot(fig)
-    elif 'show_vix_vs_spx' in locals() and show_vix_vs_spx:
-        vix = yf.download("^VIX", start=start_date, end=end_date)
-        spx = yf.download("^GSPC", start=start_date, end=end_date)
-
-        vix_close = vix["Close"]
-        spx_close = spx["Close"]
-
-        rsi_vix = RSIIndicator(close=vix_close.squeeze(), window=14).rsi()
-
-        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 8), sharex=True)
-
-        ax1.plot(vix_close, label='VIX', color='black')
-        ax1.set_ylabel("VIX", color='black')
-        ax1.tick_params(axis='y', labelcolor='black')
-        ax1.legend(loc="upper left")
-
-        ax1_2 = ax1.twinx()
-        ax1_2.plot(spx_close, label='SPX', color='blue', alpha=0.6)
-        ax1_2.set_ylabel("SPX", color='blue')
-        ax1_2.tick_params(axis='y', labelcolor='blue')
-        ax1_2.legend(loc="upper right")
-        ax1.set_title("VIX vs SPX")
-
-        ax2.plot(rsi_vix, label="VIX RSI", color='red')
-        ax2.axhline(70, linestyle='--', color='gray')
-        ax2.axhline(30, linestyle='--', color='gray')
-        ax2.set_ylabel("RSI")
-        ax2.set_title("VIX RSI")
-        ax2.legend()
-
-        st.pyplot(fig)
-    if 'show_vix_seasonality' in locals() and show_vix_seasonality:
-        st.markdown("### VIX Saisonalität (20-Jahres-Schnitt)")
-        st.image("images/vix_seasonality.png", use_container_width=True)
-        st.caption("Durchschnittliche saisonale Volatilität basierend auf 20 Jahren")
-    if 'show_SP500_seasonality' in locals() and show_SP500_seasonality:
-        st.markdown("### S&P 500 Saisonalität")
-        st.image("images/S&P500seasonality.png", use_container_width=True)
-        st.caption("Durchschnittliche saisonale Volatilität basierend auf 20 Jahren")
-    if 'show_spx_ma' in locals() and show_spx_ma:
-        plot_spx_monthly_ma_chart()
-    if 'show_sp500_pe_ratio' in locals() and show_sp500_pe_ratio:
-        st.markdown("### S&P 500 PE Ratio")
-        st.markdown("[📈 Zur Live-Grafik auf multpl.com](https://www.multpl.com/s-p-500-pe-ratio)")
-        st.caption("Externe Quelle: multpl.com – aktuelle PE Ratio immer live.")
-   # if 'show_spxa200r' in locals() and show_spxa200r:
-   #    plot_bpspx_chart()
-
-
-# 📊 Sektorrotation
-st.header("📊 Sektorrotation")
-period_map = {"1 Monat": "1mo", "3 Monate": "3mo", "6 Monate": "6mo", "12 Monate": "1y"}
-selected_period = st.selectbox("📆 Zeitraum für Performancevergleich", list(period_map.keys()), index=2)
-
-sector_etfs = {
-    "SPY": "S&P 500", "XLK": "Technologie", "XLF": "Finanzen", "XLI": "Industrie", "XLV": "Gesundheit",
-    "XLP": "Basiskonsum", "XLE": "Energie", "XLU": "Versorger", "XLY": "Zykl. Konsum",
-    "XLC": "Kommunikation", "XLB": "Rohstoffe", "XLRE": "Immobilien"
-}
-
-@st.cache_data
-def load_sector_data(tickers, period):
-    df = yf.download(tickers, period=period, interval="1wk")['Close']
-    return df.dropna()
-
-sector_data = load_sector_data(list(sector_etfs.keys()), period_map[selected_period])
-sector_perf = ((sector_data.iloc[-1] / sector_data.iloc[0]) - 1) * 100
-sector_perf = sector_perf.round(2).sort_values(ascending=False)
-
-fig2, ax2 = plt.subplots(figsize=(12, 6))
-colors = ['green' if val > sector_perf['SPY'] else 'red' for val in sector_perf]
-bars = ax2.bar(sector_perf.index.map(lambda x: sector_etfs[x]), sector_perf.values, color=colors)
-ax2.axhline(sector_perf['SPY'], linestyle='--', color='black', label='SPY Benchmark')
-for bar, value in zip(bars, sector_perf.values):
-    ax2.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.5, f'{value:.1f}%', ha='center', va='bottom')
-ax2.set_title(f"Sektor-Performance ({selected_period})", fontsize=14)
-ax2.set_ylabel("Performance in %")
-ax2.set_xticklabels(sector_perf.index.map(lambda x: sector_etfs[x]), rotation=45, ha='right')
-ax2.grid(True, axis='y')
-ax2.legend()
-st.pyplot(fig2)
-
-
-
-
-# Sidebar: Erklärung Confluence Zone
-with st.sidebar.expander("ℹ️ Erklärung: Confluence Zone"):
-    st.markdown("""
-    Eine **Confluence Zone** entsteht, wenn mehrere technische Indikatoren (z. B. Fibonacci, gleitende Durchschnitte, Volumencluster) im selben Preisbereich zusammenfallen. 
-    Diese Zonen gelten als besonders relevant für mögliche Umkehrpunkte oder Breakouts.
-    """)
-
-# Optional: Am Ende Verbindung schließen (in Streamlit meist nicht nötig)
-# conn.close()
+        """)
