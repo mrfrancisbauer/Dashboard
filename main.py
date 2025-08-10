@@ -8,7 +8,7 @@ from matplotlib.lines import Line2D
 import streamlit as st
 import yfinance as yf
 from ta.momentum import RSIIndicator
-from ta.volatility import BollingerBands
+from ta.volatility import BollingerBands, AverageTrueRange
 from scipy.signal import find_peaks
 import plotly.graph_objects as go
 # --- LSTM Forecast Integration ---
@@ -18,176 +18,321 @@ from sklearn.preprocessing import MinMaxScaler
 from tensorflow.keras.models import load_model
 from tensorflow.keras.callbacks import ModelCheckpoint
 import os
+import time
+from typing import Tuple
+import joblib
 
 
 # ==== DB Imports ====
 import sqlite3
 import json
 DB_PATH = "market_dashboard.db"
-# ==== DB Setup & Utility-Funktionen ====
-conn = sqlite3.connect("market_dashboard.db", check_same_thread=False)
-cursor = conn.cursor()
 
-# Tabellen anlegen
-cursor.execute("""
-CREATE TABLE IF NOT EXISTS historical_prices (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    ticker TEXT,
-    date TEXT,
-    open REAL,
-    high REAL,
-    low REAL,
-    close REAL,
-    volume REAL
-)
-""")
+# ---- Unified DB helpers ----
+def get_connection():
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    try:
+        # Improve concurrency and durability for Streamlit + SQLite
+        conn.execute("PRAGMA journal_mode=WAL;")
+        conn.execute("PRAGMA synchronous=NORMAL;")
+        conn.execute("PRAGMA temp_store=MEMORY;")
+        conn.execute("PRAGMA mmap_size=30000000000;")  # 30GB cap; OS will limit as needed
+    except Exception:
+        pass
+    return conn
 
-cursor.execute("""
-CREATE TABLE IF NOT EXISTS lstm_forecasts (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    ticker TEXT,
-    date_generated TEXT,
-    forecast_date TEXT,
-    forecast REAL,
-    upper_band REAL,
-    lower_band REAL,
-    model_params_json TEXT
-)
-""")
+def init_db():
+    with get_connection() as conn:
+        cur = conn.cursor()
+        # Base tables
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS historical_prices (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ticker TEXT,
+                date TEXT,
+                open REAL,
+                high REAL,
+                low REAL,
+                close REAL,
+                volume REAL
+            )
+            """
+        )
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS lstm_forecasts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ticker TEXT,
+                date_generated TEXT,
+                forecast_date TEXT,
+                forecast REAL,
+                upper_band REAL,
+                lower_band REAL,
+                model_params_json TEXT
+            )
+            """
+        )
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS confluence_zones (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ticker TEXT,
+                level REAL,
+                score INTEGER,
+                low REAL,
+                high REAL,
+                generated_at TEXT
+            )
+            """
+        )
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS trading_results (
+                trade_date TEXT,
+                product    TEXT,
+                pnl        REAL,
+                PRIMARY KEY(trade_date, product)
+            )
+            """
+        )
 
-cursor.execute("""
-CREATE TABLE IF NOT EXISTS confluence_zones (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    ticker TEXT,
-    level REAL,
-    score INTEGER,
-    low REAL,
-    high REAL,
-    generated_at TEXT
-)
-""")
-conn.commit()
+        # --- Deduplicate existing data before creating UNIQUE indices ---
+        # Keep the earliest row per natural key and delete the rest
+        cur.execute(
+            """
+            DELETE FROM historical_prices
+            WHERE id NOT IN (
+                SELECT MIN(id) FROM historical_prices GROUP BY ticker, date
+            )
+            """
+        )
+        cur.execute(
+            """
+            DELETE FROM lstm_forecasts
+            WHERE id NOT IN (
+                SELECT MIN(id) FROM lstm_forecasts GROUP BY ticker, forecast_date
+            )
+            """
+        )
+        cur.execute(
+            """
+            DELETE FROM confluence_zones
+            WHERE id NOT IN (
+                SELECT MIN(id) FROM confluence_zones GROUP BY ticker, level, generated_at
+            )
+            """
+        )
 
-# --- Trading-Log Tabelle anlegen, falls nicht vorhanden ---
-cursor.execute("""
-CREATE TABLE IF NOT EXISTS trading_results (
-    trade_date TEXT,
-    product    TEXT,
-    pnl        REAL,
-    PRIMARY KEY(trade_date, product)
-)
-""")
-conn.commit()
+        # Create UNIQUE indices with a safety retry in case duplicates appear concurrently
+        try:
+            cur.execute(
+                """
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_prices_unique
+                ON historical_prices(ticker, date)
+                """
+            )
+            cur.execute(
+                """
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_forecasts_unique
+                ON lstm_forecasts(ticker, forecast_date)
+                """
+            )
+            cur.execute(
+                """
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_zones_unique
+                ON confluence_zones(ticker, level, generated_at)
+                """
+            )
+            conn.commit()
+        except sqlite3.IntegrityError:
+            # Last‑chance dedup, then retry index creation
+            cur.execute(
+                """
+                DELETE FROM historical_prices
+                WHERE id NOT IN (
+                    SELECT MIN(id) FROM historical_prices GROUP BY ticker, date
+                )
+                """
+            )
+            cur.execute(
+                """
+                DELETE FROM lstm_forecasts
+                WHERE id NOT IN (
+                    SELECT MIN(id) FROM lstm_forecasts GROUP BY ticker, forecast_date
+                )
+                """
+            )
+            cur.execute(
+                """
+                DELETE FROM confluence_zones
+                WHERE id NOT IN (
+                    SELECT MIN(id) FROM confluence_zones GROUP BY ticker, level, generated_at
+                )
+                """
+            )
+            conn.commit()
+            # Retry creating indices
+            cur.execute(
+                """
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_prices_unique
+                ON historical_prices(ticker, date)
+                """
+            )
+            cur.execute(
+                """
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_forecasts_unique
+                ON lstm_forecasts(ticker, forecast_date)
+                """
+            )
+            cur.execute(
+                """
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_zones_unique
+                ON confluence_zones(ticker, level, generated_at)
+                """
+            )
+            conn.commit()
+
+# Initialize DB on import
+init_db()
+# only new prices will be writen into DB
+def _get_latest_price_date(ticker: str):
+    """Return latest stored date for ticker in historical_prices, or None."""
+    with get_connection() as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT MAX(date) FROM historical_prices WHERE ticker = ?", (ticker,))
+        row = cur.fetchone()
+        if row and row[0]:
+            try:
+                return pd.to_datetime(row[0])
+            except Exception as e:
+                # Log once to Streamlit if available; otherwise ignore
+                try:
+                    st.warning(f"Konnte letztes Preisdaten-Datum nicht parsen: {e}")
+                except Exception:
+                    pass
+                return None
+        return None
 
 def upsert_forecast(ticker, forecast_df, params_dict):
-    for _, row in forecast_df.iterrows():
-        params_json = json.dumps(params_dict)
-        cursor.execute("""
-        INSERT INTO lstm_forecasts (ticker, date_generated, forecast_date, forecast, upper_band, lower_band, model_params_json)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
-        """, (
-            ticker,
-            pd.Timestamp.today().strftime("%Y-%m-%d"),
-            row['Date'].strftime("%Y-%m-%d"),
-            float(row['Forecast']),
-            float(row['Upper']),
-            float(row['Lower']),
-            params_json
-        ))
-    conn.commit()
+    params_json = json.dumps(params_dict)
+    with get_connection() as conn:
+        cur = conn.cursor()
+        for _, row in forecast_df.iterrows():
+            cur.execute(
+                """
+                INSERT INTO lstm_forecasts (ticker, date_generated, forecast_date, forecast, upper_band, lower_band, model_params_json)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(ticker, forecast_date) DO UPDATE SET
+                    date_generated = excluded.date_generated,
+                    forecast = excluded.forecast,
+                    upper_band = excluded.upper_band,
+                    lower_band = excluded.lower_band,
+                    model_params_json = excluded.model_params_json
+                """,
+                (
+                    ticker,
+                    pd.Timestamp.today().strftime("%Y-%m-%d"),
+                    row['Date'].strftime("%Y-%m-%d"),
+                    float(row['Forecast']),
+                    float(row['Upper']),
+                    float(row['Lower']),
+                    params_json,
+                )
+            )
+        conn.commit()
 
-# --- Trading-Log: Upsert und Laden (verwenden DB_PATH) ---
+# --- Trading-Log: Upsert und Laden (verwenden unified helper) ---
 def upsert_trading_result(trade_date, product, pnl):
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-    cur = conn.cursor()
-    cur.execute("""
-        INSERT INTO trading_results (trade_date, product, pnl)
-        VALUES (?, ?, ?)
-        ON CONFLICT(trade_date, product) DO UPDATE SET pnl = excluded.pnl
-    """, (trade_date.strftime("%Y-%m-%d"), product, pnl))
-    conn.commit()
-    conn.close()
+    with get_connection() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            INSERT INTO trading_results (trade_date, product, pnl)
+            VALUES (?, ?, ?)
+            ON CONFLICT(trade_date, product) DO UPDATE SET pnl = excluded.pnl
+            """,
+            (trade_date.strftime("%Y-%m-%d"), product, pnl)
+        )
+        conn.commit()
 
 def load_trading_results():
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-    df = pd.read_sql_query(
-        "SELECT trade_date, product, pnl FROM trading_results ORDER BY trade_date",
-        conn
-    )
-    conn.close()
+    with get_connection() as conn:
+        df = pd.read_sql_query(
+            "SELECT trade_date, product, pnl FROM trading_results ORDER BY trade_date",
+            conn
+        )
     return df
 
 def upsert_zones(ticker, zones_list):
-    for zone in zones_list:
-        cursor.execute("""
-        INSERT INTO confluence_zones (ticker, level, score, low, high, generated_at)
-        VALUES (?, ?, ?, ?, ?, ?)
-        """, (
-            ticker,
-            float(zone['level']),
-            int(zone['score']),
-            float(zone['low']),
-            float(zone['high']),
-            pd.Timestamp.today().strftime("%Y-%m-%d")
-        ))
-    conn.commit()
+    with get_connection() as conn:
+        cur = conn.cursor()
+        generated_at = pd.Timestamp.today().strftime("%Y-%m-%d")
+        for zone in zones_list:
+            cur.execute(
+                """
+                INSERT INTO confluence_zones (ticker, level, score, low, high, generated_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(ticker, level, generated_at) DO UPDATE SET
+                    score = excluded.score,
+                    low   = excluded.low,
+                    high  = excluded.high
+                """,
+                (
+                    ticker,
+                    float(zone['level']),
+                    int(zone['score']),
+                    float(zone['low']),
+                    float(zone['high']),
+                    generated_at,
+                )
+            )
+        conn.commit()
 
-def upsert_prices(ticker, df):
-    for idx, row in df.iterrows():
-        cursor.execute("""
-        INSERT OR REPLACE INTO historical_prices (ticker, date, open, high, low, close, volume)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
-        """, (
-            ticker,
-            idx.strftime("%Y-%m-%d"),
-            float(row['Open']),
-            float(row['High']),
-            float(row['Low']),
-            float(row['Close']),
-            float(row.get('Volume', 0))
-        ))
-    conn.commit()
+def upsert_prices(ticker, df, only_new: bool = True):
+    """Upsert OHLCV rows. If only_new, insert rows with date > latest stored date."""
+    if df is None or df.empty:
+        return
+    local_df = df.copy()
+    local_df.index = pd.to_datetime(local_df.index)
 
-# ==== NEUE FUNKTIONEN: Exakter Haupt-Channel & RSI-Trendlinie ====
-def add_precise_channel(fig, series, start_idx=None, end_idx=None, color="blue", name_prefix="Main Channel"):
-    sub_series = series
-    if start_idx and end_idx:
-        sub_series = series[start_idx:end_idx]
-    upper_quantile = sub_series.quantile(0.95)
-    lower_quantile = sub_series.quantile(0.05)
-    upper_idx = sub_series[sub_series >= upper_quantile].index
-    lower_idx = sub_series[sub_series <= lower_quantile].index
-    if len(upper_idx) > 1 and len(lower_idx) > 1:
-        import matplotlib.dates as mdates
-        from scipy.stats import linregress
-        x_upper = mdates.date2num(upper_idx.to_pydatetime())
-        y_upper = sub_series[upper_idx]
-        slope_up, intercept_up, _, _, _ = linregress(x_upper, y_upper)
-        x_lower = mdates.date2num(lower_idx.to_pydatetime())
-        y_lower = sub_series[lower_idx]
-        slope_lo, intercept_lo, _, _, _ = linregress(x_lower, y_lower)
-        x_plot = mdates.date2num(sub_series.index.to_pydatetime())
-        upper_line = slope_up * x_plot + intercept_up
-        lower_line = slope_lo * x_plot + intercept_lo
-        mid_line = (upper_line + lower_line) / 2
-        fig.add_trace(go.Scatter(x=sub_series.index, y=upper_line,
-                                 mode='lines', line=dict(color=color, width=2),
-                                 name=f"{name_prefix} Top"))
-        fig.add_trace(go.Scatter(x=sub_series.index, y=lower_line,
-                                 mode='lines', line=dict(color=color, width=2),
-                                 name=f"{name_prefix} Bottom"))
-        fig.add_trace(go.Scatter(x=sub_series.index, y=mid_line,
-                                 mode='lines', line=dict(color=color, dash='dot', width=1),
-                                 name=f"{name_prefix} Mid"))
-        fig.add_shape(type="rect",
-                      x0=sub_series.index[0], x1=sub_series.index[-1],
-                      y0=min(lower_line), y1=max(upper_line),
-                      fillcolor="rgba(0, 0, 255, 0.05)", line=dict(width=0),
-                      layer="below")
+    if only_new:
+        latest = _get_latest_price_date(ticker)
+        if latest is not None:
+            local_df = local_df[local_df.index > latest]
+            if local_df.empty:
+                return
 
-
-
-
+    with get_connection() as conn:
+        cur = conn.cursor()
+        rows = [
+            (
+                ticker,
+                idx.strftime("%Y-%m-%d"),
+                float(row['Open']),
+                float(row['High']),
+                float(row['Low']),
+                float(row['Close']),
+                float(row.get('Volume', 0)),
+            )
+            for idx, row in local_df.iterrows()
+        ]
+        if not rows:
+            return
+        cur.executemany(
+            """
+            INSERT INTO historical_prices (ticker, date, open, high, low, close, volume)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(ticker, date) DO UPDATE SET
+                open = excluded.open,
+                high = excluded.high,
+                low  = excluded.low,
+                close= excluded.close,
+                volume = excluded.volume
+            """,
+            rows
+        )
+        conn.commit()
 
 # === Investing Tab (Stock Screener) ===
 # -- Small utilities reused by the screener --
@@ -428,9 +573,8 @@ resolution_note = {
 st.sidebar.markdown(f"**Ausgewähltes Intervall:** {resolution_note.get(interval, '')}")
 
 vereinfachte_trading = st.sidebar.checkbox("🎯 Vereinfachte Trading-Ansicht", value=False)
+debug_mode = st.sidebar.checkbox("🔧 Debug anzeigen", value=False)
 
-# ==== Sidebar-Checkboxen für neue Overlays ====
-show_precise_channel = st.sidebar.checkbox("🎯 Exakten Haupt-Channel anzeigen", value=True, disabled=vereinfachte_trading)
 
 # Sidebar: Anzeigeoptionen für Indikatoren und Signale
 with st.sidebar.expander("🔍 Anzeigen"):
@@ -495,7 +639,7 @@ end_date = st.sidebar.date_input("📅 Enddatum", value=default_end_date)
 # --- Historical Forecasts (from DB) in Forecast Tab ---
 with tab_forecast:
     st.subheader("📜 Historische Forecasts (aus DB)")
-    conn_hist = sqlite3.connect(DB_PATH)
+    conn_hist = get_connection()
     # Load prices from DB (falls vorhanden)
     prices_query = """
         SELECT date, open, high, low, close, volume
@@ -560,39 +704,124 @@ with st.sidebar.expander("ℹ️ Erklärung zur Zonenprominenz"):
     """)
 
 
+
+# === Data Loading & Indicator Helpers ===
+
+@st.cache_data(ttl=600)
+def fetch_prices(ticker: str, start, end, interval: str) -> pd.DataFrame:
+    """Download raw OHLCV data via yfinance with retries, then sanitize.
+    Ensures: DateTimeIndex (UTC naive), strictly increasing, no duplicates, non-negative prices.
+    """
+    last_err = None
+    for attempt in range(3):
+        try:
+            df = yf.download(ticker, start=start, end=end, interval=interval, auto_adjust=False, progress=False)
+            if df is None or df.empty:
+                raise ValueError("Leere Antwort von yfinance")
+            # Flatten MultiIndex columns if present
+            if isinstance(df.columns, pd.MultiIndex):
+                df.columns = df.columns.get_level_values(0)
+            df.index = pd.to_datetime(df.index)
+            df = df.dropna(how="any")
+            # Validation & cleaning
+            df = df[~df.index.duplicated(keep="last")]
+            df = df.sort_index()
+            numeric_cols = [c for c in ["Open","High","Low","Close","Adj Close","Volume"] if c in df.columns]
+            for c in numeric_cols:
+                df = df[df[c].astype(float) >= 0]
+            # Remove pathological candles (e.g., >30% gap within bar due to bad ticks)
+            if {"High","Low","Close"}.issubset(df.columns):
+                span = (df["High"] - df["Low"]).abs() / df["Close"].replace(0, pd.NA)
+                df = df[(span < 2.0) | span.isna()]  # drop bars with >200% intrabar span
+            return df
+        except Exception as e:
+            last_err = e
+            time.sleep(0.8 * (attempt + 1))
+    # If we got here, all retries failed
+    st.error(f"Fehler beim Laden von {ticker}: {last_err}")
+    return pd.DataFrame()
+
+# --- Sequence/time split helpers for LSTM ---
+def time_split(df: pd.DataFrame, train_frac: float = 0.7, val_frac: float = 0.15) -> Tuple[pd.DatetimeIndex, pd.DatetimeIndex, pd.DatetimeIndex]:
+    """Return index-based time split boundaries (train/val/test) for a sorted DateTimeIndex df."""
+    if df.empty:
+        return df.index, df.index, df.index
+    n = len(df)
+    i_train = int(n * train_frac)
+    i_val = int(n * (train_frac + val_frac))
+    return df.index[:i_train], df.index[i_train:i_val], df.index[i_val:]
+
+def create_sequences_no_crossing(data: np.ndarray, seq_len: int = 30) -> Tuple[np.ndarray, np.ndarray]:
+    """Create supervised sequences X,y *within* one contiguous block (no cross-asset leakage)."""
+    X, y = [], []
+    for i in range(len(data) - seq_len):
+        X.append(data[i:i + seq_len])
+        y.append(data[i + seq_len, 0])  # target = next normalized Close
+    return np.array(X), np.array(y)
+
+def compute_indicators(df: pd.DataFrame, features: list | None = None) -> pd.DataFrame:
+    """Compute technical indicators. If features given, compute only those."""
+    if df is None or df.empty:
+        return df if df is not None else pd.DataFrame()
+    want = set([f.lower() for f in features]) if features else None
+    out = df.copy()
+    close = out['Close'].squeeze()
+
+    # MAs
+    if want is None or 'ma' in want:
+        out['MA50'] = close.rolling(window=50).mean()
+        out['MA100'] = close.rolling(window=100).mean()
+        out['MA200'] = close.rolling(window=200).mean()
+        out['MA20']  = close.rolling(window=20).mean()
+
+    # RSI
+    out['Close_Series'] = close
+    if want is None or 'rsi' in want:
+        out['RSI'] = RSIIndicator(close=out['Close_Series'], window=14).rsi()
+
+    # EMAs
+    if want is None or 'ema' in want:
+        out['EMA5']  = close.ewm(span=5,  adjust=False).mean()
+        out['EMA9']  = close.ewm(span=9,  adjust=False).mean()
+        out['EMA14'] = close.ewm(span=14, adjust=False).mean()
+        out['EMA50'] = close.ewm(span=50, adjust=False).mean()
+        out['EMA69'] = close.ewm(span=69, adjust=False).mean()
+        out['EMA_5W'] = close.ewm(span=25,   adjust=False).mean()
+        out['EMA_5Y'] = close.ewm(span=1260, adjust=False).mean()
+
+    # Bollinger
+    if want is None or 'bb' in want:
+        bb = BollingerBands(close=out['Close_Series'], window=20, window_dev=2)
+        out['BB_upper'] = bb.bollinger_hband()
+        out['BB_lower'] = bb.bollinger_lband()
+        out['BB_mid']   = bb.bollinger_mavg()
+
+    # ATR(14) – true average true range
+    if want is None or 'atr' in want:
+        try:
+            atr_ind = AverageTrueRange(high=out['High'], low=out['Low'], close=out['Close_Series'], window=14)
+            out['ATR14'] = atr_ind.average_true_range()
+        except Exception:
+            # Fallback if any column missing
+            out['ATR14'] = (out['High'].rolling(14).max() - out['Low'].rolling(14).min())
+
+    return out
+
+
+
+
 @st.cache_data(ttl=600)  # cache expires after 10 minutes
 def load_data(ticker, start, end, interval):
-    df = yf.download(ticker, start=start, end=end, interval=interval, auto_adjust=False)
-    df.dropna(inplace=True)
-    # Debug-Ausgaben für df['Close']
-    print(df['Close'].head())
-    print(type(df['Close']))
-    if isinstance(df['Close'], pd.DataFrame):
-        df['MA50'] = df['Close'].iloc[:, 0].rolling(window=50).mean()
-    else:
-        df['MA50'] = df['Close'].rolling(window=50).mean()
-    df['MA100'] = df['Close'].rolling(window=100).mean()
-    df['MA200'] = df['Close'].rolling(window=200).mean()
-    df['Close_Series'] = df['Close'].squeeze()
-    df['RSI'] = RSIIndicator(close=df['Close_Series'], window=14).rsi()
-
-    df['EMA5'] = df['Close'].ewm(span=5, adjust=False).mean()
-    df['EMA9'] = df['Close'].ewm(span=9, adjust=False).mean()
-    df['EMA14'] = df['Close'].ewm(span=14, adjust=False).mean()
-    df['EMA69'] = df['Close'].ewm(span=69, adjust=False).mean()
-    df['EMA_5W'] = df['Close'].ewm(span=5 * 5, adjust=False).mean()  # 5 Wochen EMA auf Tagesbasis
-    df['EMA_5Y'] = df['Close'].ewm(span=5 * 252, adjust=False).mean()  # 5 Jahres EMA auf Tagesbasis
-    df['MA20'] = df['Close'].rolling(window=20).mean()
-
-    bb = BollingerBands(close=df['Close'].squeeze(), window=20, window_dev=2)
-    df['BB_upper'] = bb.bollinger_hband()
-    df['BB_lower'] = bb.bollinger_lband()
-    df['BB_mid'] = bb.bollinger_mavg()
-    return df
+    raw = fetch_prices(ticker, start, end, interval)
+    enriched = compute_indicators(raw)
+    return enriched
 
 if st.button("🔄 Daten neu laden"):
     st.cache_data.clear()
 data = load_data(ticker, start_date, end_date, interval)
+if data is None or data.empty:
+    st.warning("Keine Kursdaten geladen. Bitte Ticker/Zeitraum/Intervall prüfen.")
+    st.stop()
 data.index = pd.to_datetime(data.index)
 close_series = data['Close_Series']
 # --- DB Insert: historical_prices
@@ -633,8 +862,8 @@ fib = {
     "1.0": low,
 }
 
-# Trendrichtung erkennen
-if close_series[-1] > close_series[0]:
+# Trendrichtung erkennen (robust gegen Pandas-Änderungen in positional indexing)
+if close_series.iloc[-1] > close_series.iloc[0]:
     trend = "up"
 else:
     trend = "down"
@@ -680,9 +909,259 @@ else:  # Downtrend
         "0.786": high - 0.786 * (high - low),
         "1.0": low,
     }
+
+# --- Confluence Zone Evaluator ---
+def evaluate_confluence_zones(data: pd.DataFrame, zones: list, lookahead: int = 10) -> dict:
+    """Evaluate whether price touched the opposite side of the band within N bars after first touch.
+    Returns hit_rate and avg_forward_return for simple sanity checking.
+    """
+    if not zones or data.empty:
+        return {"count": 0, "hit_rate": np.nan, "avg_forward_return_%": np.nan}
+    closes = data['Close_Series']
+    hits, rets, n = 0, [], 0
+    for z in zones:
+        level = z.get('mid', z['level'])
+        # find first index where price crosses inside the band
+        band_low, band_high = z['low'], z['high']
+        touched = data[(closes >= band_low) & (closes <= band_high)]
+        if touched.empty:
+            continue
+        first_ix = touched.index[0]
+        # look ahead
+        future = closes.loc[first_ix:].iloc[1:1+lookahead]
+        if future.empty:
+            continue
+        n += 1
+        # define a naive target: move of +1 ATR from mid in direction of prevailing trend
+        if 'ATR14' in data.columns and not data['ATR14'].dropna().empty:
+            atr = float(data['ATR14'].dropna().reindex(future.index, method='ffill').iloc[0])
+        else:
+            atr = float(np.nan)
+        # measure simple forward return from first touch to end of window
+        ret = (future.iloc[-1] - closes.loc[first_ix]) / closes.loc[first_ix]
+        rets.append(float(ret) * 100)
+        # hit if price exits band by at least half-ATR
+        if not np.isnan(atr):
+            if (future.max() >= band_high + 0.5*atr) or (future.min() <= band_low - 0.5*atr):
+                hits += 1
+        else:
+            # fallback: exit band any direction
+            if (future.max() > band_high) or (future.min() < band_low):
+                hits += 1
+    hit_rate = (hits / n) if n else np.nan
+    avg_ret = (np.mean(rets) if rets else np.nan)
+    return {"count": n, "hit_rate": hit_rate, "avg_forward_return_%": avg_ret}
+
+# --- Auto-Tuning Helper -------------------------------------------------------
+def run_auto_tuning(data: pd.DataFrame,
+                    fib: dict,
+                    ma_series_dict: dict,
+                    vol_bins: tuple,
+                    prom_list: list[int],
+                    score_list: list[int],
+                    merge_tol_values: list[float],
+                    lookahead: int = 10) -> pd.DataFrame:
+    """Grid-Search über Prominenz, Mindestscore, Merge-Tol.; misst Trefferquote und Ø-Rendite."""
+    results = []
+    if data is None or data.empty:
+        return pd.DataFrame()
+
+    for prom in prom_list:
+        try:
+            zones_raw = find_confluence_zones(
+                data, prominence=prom, fibs=fib,
+                ma_series_dict=ma_series_dict, vol_bins=vol_bins
+            )
+        except Exception:
+            zones_raw = []
+        for mtol in merge_tol_values:
+            try:
+                zones = merge_overlapping_zones(zones_raw, merge_tol_pct=mtol)
+            except Exception:
+                zones = zones_raw
+            for min_score in score_list:
+                zones_f = [z for z in zones if z.get('score', 0) >= min_score]
+                ev = evaluate_confluence_zones(data, zones_f, lookahead=lookahead)
+                results.append({
+                    "prominence": prom,
+                    "min_score": int(min_score),
+                    "merge_tol_pct": float(mtol),
+                    "tested": ev.get("count", 0),
+                    "hit_rate%": None if pd.isna(ev.get("hit_rate", np.nan)) else round(100*ev["hit_rate"], 2),
+                    "avg_fwd_ret%": None if pd.isna(ev.get("avg_forward_return_%", np.nan)) else round(ev["avg_forward_return_%"], 3)
+                })
+
+    df = pd.DataFrame(results)
+    if df.empty:
+        return df
+
+    # Ranking: erst Hit-Rate, dann Ø-Rendite; Mindestanzahl Zonen = 5
+    df["tested"] = df["tested"].fillna(0).astype(int)
+    df_rank = df[df["tested"] >= 5].copy()
+    if df_rank.empty:
+        df_rank = df.copy()
+    df_rank["_rank_key1"] = df_rank["hit_rate%"].fillna(-1)
+    df_rank["_rank_key2"] = df_rank["avg_fwd_ret%"].fillna(-999)
+    df_rank = df_rank.sort_values(["_rank_key1", "_rank_key2", "tested"], ascending=[False, False, False])
+    df_rank.drop(columns=["_rank_key1","_rank_key2"], inplace=True)
+    return df_rank
+
+# --- Neue Confluence Zone Logik ---
+def find_confluence_zones(data: pd.DataFrame, prominence=300, fibs=None, ma_series_dict=None, vol_bins: tuple | None = None):
+    """
+    Identifiziert Confluence Zones mit erweitertem Score & Typ:
+    - Score-Punkte (max 5): 1=Reaktion (Prominenz), 2=Fibonacci-Nähe, 3=MA-Nähe, 4=BB-Mid-Nähe, 5=Volumen-Cluster
+    - Typ: 'buy' (von Tiefs), 'test' (von Hochs)
+    - Bandbreite: max(1.5% vom Level, 0.5 * ATR14) – sofern ATR verfügbar
+    """
+    if data is None or data.empty:
+        return []
+
+    series = data['Close_Series']
+    atr = data['ATR14'] if 'ATR14' in data.columns else None
+    bb_mid = data['BB_mid'] if 'BB_mid' in data.columns else (data['MA20'] if 'MA20' in data.columns else None)
+
+    # Hilfsfunktionen
+    def _is_near_fib(val: float, tol=0.015) -> bool:
+        if not fibs:
+            return False
+        for f in fibs.values():
+            try:
+                if abs(val - float(f)) / max(1.0, abs(float(f))) < tol:
+                    return True
+            except Exception:
+                continue
+        return False
+
+    def _is_near_ma(val: float, idx: int, tol=0.015) -> bool:
+        if not ma_series_dict:
+            return False
+        for _, ma_ser in ma_series_dict.items():
+            if ma_ser is None or ma_ser.dropna().empty:
+                continue
+            if idx < len(ma_ser):
+                ma_val = float(ma_ser.iloc[idx])
+                if pd.notna(ma_val) and abs(val - ma_val) / max(1.0, abs(ma_val)) < tol:
+                    return True
+        return False
+
+    def _is_near_bb_mid(val: float, idx: int, tol=0.01) -> bool:
+        if bb_mid is None or bb_mid.dropna().empty:
+            return False
+        if idx < len(bb_mid):
+            m = float(bb_mid.iloc[idx])
+            return pd.notna(m) and abs(val - m) / max(1.0, abs(m)) < tol
+        return False
+
+    def _in_volume_cluster(val: float, top_q: float = 0.75) -> bool:
+        if not vol_bins:
+            return False
+        hist_vals, bin_edges = vol_bins
+        if len(hist_vals) == 0:
+            return False
+        # Finde Bin
+        bin_idx = np.digitize([val], bin_edges)[0] - 1
+        bin_idx = max(0, min(bin_idx, len(hist_vals) - 1))
+        threshold = np.quantile(hist_vals, top_q)
+        return hist_vals[bin_idx] >= threshold
+
+    # Reaktionen (Prominenz)
+    lows_idx, _ = find_peaks(-series, prominence=prominence)
+    highs_idx, _ = find_peaks(series, prominence=prominence)
+
+    zones = []
+    for idx_list, ztype in ((lows_idx, 'buy'), (highs_idx, 'test')):
+        for i in idx_list:
+            lvl = float(series.iloc[i])
+            score = 0
+            score += 1  # Preisreaktion vorhanden
+            if _is_near_fib(lvl):
+                score += 1
+            if _is_near_ma(lvl, i):
+                score += 1
+            if _is_near_bb_mid(lvl, i):
+                score += 1
+            if _in_volume_cluster(lvl):
+                score += 1
+            # Bandbreite (ATR-basiert, falls vorhanden)
+            if atr is not None and not atr.dropna().empty and i < len(atr):
+                bw = max(0.015 * lvl, 0.5 * float(atr.iloc[i]))
+            else:
+                bw = 0.015 * lvl
+            zones.append({
+                'level': lvl,
+                'score': int(score),
+                'low': lvl - bw,
+                'high': lvl + bw,
+                'mid': lvl,
+                'type': ztype
+            })
+    return zones
+
+# --- Merge Overlapping Confluence Zones ---
+def merge_overlapping_zones(zones: list, merge_tol_pct: float = 0.01) -> list:
+    """Merge overlapping/adjacent zones; aggregate score (max) and widen bounds."""
+    if not zones:
+        return []
+    zones = sorted(zones, key=lambda z: z['mid'])
+    merged = []
+    cur = zones[0].copy()
+    for z in zones[1:]:
+        # overlap if ranges intersect or are very close (tolerance percentage of price level)
+        tol = merge_tol_pct * max(cur['mid'], z['mid'])
+        if z['low'] <= cur['high'] + tol and z['type'] == cur['type']:
+            cur['low'] = min(cur['low'], z['low'])
+            cur['high'] = max(cur['high'], z['high'])
+            cur['mid'] = (cur['low'] + cur['high']) / 2
+            cur['score'] = max(cur['score'], z['score'])
+        else:
+            merged.append(cur)
+            cur = z.copy()
+    merged.append(cur)
+    return merged
+
 # Volumenprofil
 hist_vals, bin_edges = np.histogram(close_series, bins=price_bins)
 max_volume = max(hist_vals)
+
+# --- Sidebar: Auto-Tuning -----------------------------------------------------
+with st.sidebar.expander("🤖 Auto-Tuning (Prominenz & Konfluenz)", expanded=False):
+    st.caption("Finde automatisch die Kombination mit hoher Trefferquote und solider Ø-Rendite.")
+    prom_values  = st.text_input("Prominenz-Liste", value="100,200,400,600,800")
+    score_values = st.text_input("Min-Score-Liste", value="2,3,4,5")
+    merge_values = st.text_input("Merge-Toleranz (%)", value="0.5,1.0")
+    lookahead_sel = st.number_input("Lookahead (Bars)", min_value=3, max_value=40, value=10, step=1)
+    start_tuning = st.button("🔎 Auto-Tuning starten", use_container_width=True)
+
+if 'autotune_df' not in st.session_state:
+    st.session_state['autotune_df'] = pd.DataFrame()
+    st.session_state['autotune_best'] = None
+
+if start_tuning:
+    try:
+        prom_list = [int(x.strip()) for x in prom_values.split(',') if x.strip()]
+    except Exception:
+        prom_list = [100,200,400,600,800]
+    try:
+        score_list = [int(x.strip()) for x in score_values.split(',') if x.strip()]
+    except Exception:
+        score_list = [2,3,4,5]
+    try:
+        merge_tol_values = [float(x.strip())/100.0 for x in merge_values.split(',') if x.strip()]
+    except Exception:
+        merge_tol_values = [0.005, 0.01]
+
+    ma_series_dict = {'MA200': data.get('MA200'), 'EMA50': data.get('EMA50')}
+    vol_bins = (hist_vals, bin_edges)
+
+    with st.spinner("Auto-Tuning läuft…"):
+        df_rank = run_auto_tuning(
+            data, fib, ma_series_dict, vol_bins,
+            prom_list, score_list, merge_tol_values,
+            lookahead_sel
+        )
+    st.session_state['autotune_df'] = df_rank
+    st.session_state['autotune_best'] = (df_rank.iloc[0].to_dict() if not df_rank.empty else None)
 
 # Plot: Matplotlib-Chart
 fig, ax = plt.subplots(figsize=(14, 8))
@@ -709,7 +1188,7 @@ ax.plot(data['BB_mid'],   label='BB Mid',   linestyle='-', linewidth=1.0, color=
 
 # Legende gut lesbar – außerhalb rechts
 ax.legend(loc='center left', bbox_to_anchor=(1.01, 0.5),
-          framealpha=0.95, facecolor='white', edgecolor='#dddddd',
+          framealpha=0.95, facecolor='#111111', edgecolor='#dddddd',
           fontsize=11, ncol=1)
 
 # Signalpunkte
@@ -717,11 +1196,11 @@ ax.scatter(buy_zone.index, close_series.loc[buy_zone.index], label='Buy Zone (Si
 #ax.scatter(test_zone.index, close_series.loc[test_zone.index], label='Test Zone (Signal)', marker='x', color='red', s=80)
 
 # Set axis label and tick colors to dark for visibility
-ax.tick_params(axis='x', colors='black')
-ax.tick_params(axis='y', colors='black')
-ax.xaxis.label.set_color('black')
-ax.yaxis.label.set_color('black')
-ax.title.set_color('black')
+ax.tick_params(axis='x', colors='#111111')
+ax.tick_params(axis='y', colors='#111111')
+ax.xaxis.label.set_color('#111111')
+ax.yaxis.label.set_color('#111111')
+ax.title.set_color('#111111')
 
 
 ## Remove all sliders for RSI, MA-Nähe, Y-Achsen-Zoom, Clustering-Schwelle und Volume-Bins
@@ -750,152 +1229,97 @@ with st.sidebar.expander("🤖 Automatisches Multimarkt-LSTM-Training"):
     if st.button("🔄 Modell mit mehreren Märkten trainieren"):
         st.info("📥 Lade kombinierte Daten (mehrere Indizes & Aktien)...")
 
-        tickers = ["^GSPC", "^NDX", "^DJI", "^RUT", "AAPL", "MSFT", "NVDA", "TSLA"]
-        frames = []
+        base_tickers = ["^GSPC", "^NDX", "^DJI", "^RUT", "AAPL", "MSFT", "NVDA", "TSLA"]
+        frames = {}
 
-        for ticker_symbol in tickers:
-            df = yf.download(ticker_symbol, start=start_date, end=end_date, interval="1d", auto_adjust=True)
+        for ticker_symbol in base_tickers:
+            df = fetch_prices(ticker_symbol, start=start_date, end=end_date, interval="1d")
             if df.empty or 'Close' not in df.columns:
                 continue
-
-            df['Close_Series'] = df['Close'].squeeze()
-            df['EMA5'] = df['Close_Series'].ewm(span=5, adjust=False).mean()
-            df['MA20'] = df['Close_Series'].rolling(window=20).mean()
-            df['MA50'] = df['Close_Series'].rolling(window=50).mean()
-            df['RSI'] = RSIIndicator(close=df['Close_Series'], window=14).rsi()
-
-            vix_df = yf.download("^VIX", start=start_date, end=end_date, interval="1d", auto_adjust=True)
-            vix_df['VIX_SMA5'] = vix_df['Close'].rolling(window=5).mean()
-            vix_df['VIX_RSI'] = RSIIndicator(close=vix_df['Close'].squeeze(), window=14).rsi()
-            vix_df['VIX_Change'] = vix_df['Close'].pct_change()
-            vix_df['Month'] = vix_df.index.month / 12.0
-            vix_df = vix_df[['Close', 'VIX_SMA5', 'VIX_RSI', 'VIX_Change', 'Month']]
-            vix_df.rename(columns={'Close': 'VIX_Close'}, inplace=True)
-
-            df = df.join(vix_df, how='left')
-            df['RSI_Change'] = df['RSI'].diff()
-            df['Close_MA20_Pct'] = (df['Close_Series'] - df['MA20']) / df['MA20']
-            df['Close_EMA5_Pct'] = (df['Close_Series'] - df['EMA5']) / df['EMA5']
-            df.dropna(inplace=True)
-
-            features_df = df[['Close_Series', 'RSI', 'MA50', 'VIX_Close', 'VIX_SMA5', 'VIX_RSI',
-                              'VIX_Change', 'Month', 'RSI_Change', 'Close_MA20_Pct', 'Close_EMA5_Pct']]
-            frames.append(features_df)
+            # Feature engineering per-asset
+            tmp = pd.DataFrame(index=df.index)
+            tmp['Close_Series'] = df['Close'].astype(float)
+            tmp['EMA5'] = tmp['Close_Series'].ewm(span=5, adjust=False).mean()
+            tmp['MA20'] = tmp['Close_Series'].rolling(window=20).mean()
+            tmp['MA50'] = tmp['Close_Series'].rolling(window=50).mean()
+            tmp['RSI'] = RSIIndicator(close=tmp['Close_Series'], window=14).rsi()
+            # Join VIX features
+            vix_df = fetch_prices("^VIX", start=start_date, end=end_date, interval="1d")
+            if not vix_df.empty:
+                vix_df = vix_df.rename(columns={"Close": "VIX_Close"})
+                vix_df['VIX_SMA5'] = vix_df['VIX_Close'].rolling(5).mean()
+                vix_df['VIX_RSI'] = RSIIndicator(close=vix_df['VIX_Close'].squeeze(), window=14).rsi()
+                vix_df['VIX_Change'] = vix_df['VIX_Close'].pct_change()
+                vix_df['Month'] = vix_df.index.month / 12.0
+                vix_df = vix_df[['VIX_Close','VIX_SMA5','VIX_RSI','VIX_Change','Month']]
+                tmp = tmp.join(vix_df, how='left')
+            # Extra deltas
+            tmp['RSI_Change'] = tmp['RSI'].diff()
+            tmp['Close_MA20_Pct'] = (tmp['Close_Series'] - tmp['MA20']) / tmp['MA20']
+            tmp['Close_EMA5_Pct'] = (tmp['Close_Series'] - tmp['EMA5']) / tmp['EMA5']
+            tmp.dropna(inplace=True)
+            frames[ticker_symbol] = tmp
 
         if not frames:
             st.error("❌ Keine gültigen Daten gefunden.")
         else:
-            combined_df = pd.concat(frames, axis=0)
-            combined_df.dropna(inplace=True)
-
+            # Fit scaler on the concatenated feature space but build sequences per asset to avoid cross-asset leakage
+            feature_cols = ['Close_Series','RSI','MA50','VIX_Close','VIX_SMA5','VIX_RSI','VIX_Change','Month','RSI_Change','Close_MA20_Pct','Close_EMA5_Pct']
+            concat_for_scaler = pd.concat([f[feature_cols] for f in frames.values()], axis=0).dropna()
             scaler = MinMaxScaler()
-            scaled_features = scaler.fit_transform(combined_df)
+            scaler.fit(concat_for_scaler.values)
+            joblib.dump(scaler, 'lstm_scaler.pkl')
 
-            def create_sequences(data, seq_len=30):
-                X, y = [], []
-                for i in range(len(data) - seq_len):
-                    X.append(data[i:i + seq_len])
-                    y.append(data[i + seq_len, 0])
-                return np.array(X), np.array(y)
+            # Build sequences per asset, then stack
+            X_list, y_list = [], []
+            for tk, fdf in frames.items():
+                feats = fdf[feature_cols].dropna().values
+                feats_scaled = scaler.transform(feats)
+                X_tk, y_tk = create_sequences_no_crossing(feats_scaled, seq_len=30)
+                if len(X_tk) > 0:
+                    X_list.append(X_tk)
+                    y_list.append(y_tk)
+            if not X_list:
+                st.error("❌ Zu wenige Sequenzen für das Training.")
+            else:
+                X_all = np.concatenate(X_list, axis=0)
+                y_all = np.concatenate(y_list, axis=0)
 
-            sequence_length = 30
-            X_seq, y_seq = create_sequences(scaled_features, sequence_length)
-            expected_shape = (sequence_length, scaled_features.shape[1])
+                # Time-based split on concatenated sequences (approximate, since each block is contiguous)
+                n = len(X_all)
+                i_train = int(n * 0.75)
+                i_val = int(n * 0.9)
+                X_train, y_train = X_all[:i_train], y_all[:i_train]
+                X_val,   y_val   = X_all[i_train:i_val], y_all[i_train:i_val]
+                X_test,  y_test  = X_all[i_val:], y_all[i_val:]
 
-            model = Sequential()
-            model.add(LSTM(64, activation='relu', input_shape=expected_shape))
-            model.add(Dense(1))
-            model.compile(optimizer='adam', loss='mse', run_eagerly=True)
+                expected_shape = (X_train.shape[1], X_train.shape[2])
+                model = Sequential()
+                model.add(LSTM(96, activation='tanh', input_shape=expected_shape, return_sequences=False))
+                model.add(Dense(1))
+                model.compile(optimizer='adam', loss='mse')
 
-            checkpoint = ModelCheckpoint("lstm_model.keras", monitor='loss', save_best_only=True, verbose=0)
-            import tensorflow as tf
-            early_stop = tf.keras.callbacks.EarlyStopping(monitor='loss', patience=5, restore_best_weights=True)
+                checkpoint = ModelCheckpoint("lstm_model.keras", monitor='val_loss', save_best_only=True, verbose=0)
+                import tensorflow as tf
+                early_stop = tf.keras.callbacks.EarlyStopping(monitor='val_loss', patience=8, restore_best_weights=True)
 
-            epochs = 50
-            batch_size = 16
-            progress_bar = st.progress(0)
-            status_text = st.empty()
+                epochs = 60
+                batch_size = 64
+                progress_bar = st.progress(0)
+                status_text = st.empty()
 
-            for epoch in range(epochs):
-                model.fit(X_seq, y_seq, epochs=1, batch_size=batch_size, verbose=0, callbacks=[checkpoint, early_stop])
-                progress = (epoch + 1) / epochs
-                progress_bar.progress(progress)
-                status_text.text(f"Training... Epoche {epoch + 1}/{epochs}")
+                for epoch in range(epochs):
+                    hist = model.fit(X_train, y_train, validation_data=(X_val, y_val), epochs=1, batch_size=batch_size, verbose=0, callbacks=[checkpoint, early_stop])
+                    progress = (epoch + 1) / epochs
+                    progress_bar.progress(progress)
+                    status_text.text(f"Training... Epoche {epoch + 1}/{epochs} | val_loss={hist.history['val_loss'][0]:.6f}")
+                    # Break early if early_stop triggered (monitored via patience)
+                    if len(model.history.history.get('val_loss', [])) > 0 and early_stop.stopped_epoch:
+                        break
 
-            progress_bar.progress(1.0)
-            status_text.text("✅ Multimarkt-Training abgeschlossen.")
-
-
-
-# Statischer Chart
-
-#show_static = st.sidebar.checkbox("📷 Statischen Chart anzeigen", value=False)
-
-
-
-
-# --- Neue Confluence Zone Logik ---
-def is_near_fibonacci_level(price, fibs=None, tolerance=0.01):
-    """True, wenn Preis nahe an einem Fibonacci-Level liegt."""
-    if fibs is None:
-        return False
-    for val in fibs.values():
-        if abs(float(price) - float(val)) / float(val) < tolerance:
-            return True
-    return False
-
-def is_near_ma(price, ma_values, tolerance=0.015):
-    """True, wenn Preis nahe an einem der angegebenen MA-Werte liegt."""
-    for ma in ma_values:
-        if pd.notna(ma) and abs(price - ma) / ma < tolerance:
-            return True
-    return False
-
-def find_confluence_zones(series, prominence=300, fibs=None, ma_series_dict=None):
-    """
-    Identifiziert Confluence Zones (ehemals Buy/Test-Zonen) mit 3-Punkte-Score.
-    Score: +1 lokale Preisreaktion (Prominenz), +1 Nähe Fibonacci, +1 Nähe MA.
-    """
-    # 1. Lokale Extrema (Preisreaktion)
-    lows_idx, _ = find_peaks(-series, prominence=prominence)
-    highs_idx, _ = find_peaks(series, prominence=prominence)
-    zone_idxs = sorted(set(list(lows_idx) + list(highs_idx)))
-    zone_levels = [series[i] for i in zone_idxs]
-    zones = []
-    for i, lvl in zip(zone_idxs, zone_levels):
-        zone_score = 0
-        # 1. Lokale Preisreaktion (immer gegeben, da durch Prominenz identifiziert)
-        zone_score += 1
-        # 2. Nähe Fibonacci-Level
-        fib_hit = is_near_fibonacci_level(lvl, fibs=fibs, tolerance=0.015)
-        if fib_hit:
-            zone_score += 1
-        # 3. Nähe zu gleitendem Durchschnitt (MA200 oder EMA50)
-        ma_hit = False
-        if ma_series_dict is not None:
-            for ma_name, ma_ser in ma_series_dict.items():
-                # Nächstliegender Index für diesen Level
-                nearest_idx = np.abs(series.values - lvl).argmin()
-                ma_val = ma_ser.iloc[nearest_idx] if nearest_idx < len(ma_ser) else np.nan
-                if pd.notna(ma_val) and abs(lvl - ma_val) / ma_val < 0.015:
-                    ma_hit = True
-                    break
-        if ma_hit:
-            zone_score += 1
-        # Compute low/high/mid for zone labeling
-        band = lvl * 0.015  # 1.5% band
-        zone_low = lvl - band
-        zone_high = lvl + band
-        zone_mid = lvl
-        zones.append({
-            'level': lvl,
-            'score': zone_score,
-            'low': zone_low,
-            'high': zone_high,
-            'mid': zone_mid
-        })
-    return zones
-
+                # Simple out-of-sample metric
+                test_mse = float(model.evaluate(X_test, y_test, verbose=0)) if len(X_test) else float('nan')
+                st.success(f"✅ Multimarkt-Training abgeschlossen. Test-MSE: {test_mse:.6f}")
 # Buy-/Test-Zonen als Flächen (je 1 Rechteck pro Zone mit 1.5% Bandbreite)
 valid_ma200 = data['MA200'].dropna()
 if not valid_ma200.empty:
@@ -930,14 +1354,13 @@ if test_levels:
     test_upper_auto = test_max * (1 + 0.015)
     ax.axhspan(test_lower_auto, test_upper_auto, color='#ff6600', alpha=0.1, label='Test-Zone automatisch')
 
-## --- Entferne Buy-/Test-Zonen-Flächen und zeichne nur noch Confluence Zones ---
-# Bestimme Confluence Zones mit Score
-ma_series_dict = {'MA200': data['MA200'], 'EMA50': data['EMA14']}  # EMA14 als EMA50-Ersatz, falls EMA50 nicht vorhanden
+# Bestimme Confluence Zones mit Score und merge sie zu breiten Bändern
+ma_series_dict = {'MA200': data['MA200'], 'EMA50': data['EMA50']}
 confluence_zones = find_confluence_zones(
-    close_series, prominence=zone_prominence, fibs=fib, ma_series_dict=ma_series_dict
+    data, prominence=zone_prominence, fibs=fib, ma_series_dict=ma_series_dict, vol_bins=(hist_vals, bin_edges)
 )
-# Filtere nach Score
-confluence_zones = [z for z in confluence_zones if z['score'] >= selected_min_score]
+# Merge overlapping zones to form broader bands
+confluence_zones = merge_overlapping_zones(confluence_zones, merge_tol_pct=0.01)
 # --- DB Insert: confluence_zones
 upsert_zones(ticker, confluence_zones)
 # Zeichne Confluence Zones als horizontale Linien mit neuem Label-Stil
@@ -979,18 +1402,17 @@ for i, zone in enumerate(confluence_zones):
         arrowprops=None
     )
     # --- Kursziel unterhalb der aktuellen Zone anzeigen ---
-    # Berechnung des ATR (14 Perioden)
-    atr = data['High'].rolling(window=14).max() - data['Low'].rolling(window=14).min()
-    atr_value = atr.iloc[-1] if isinstance(atr, pd.Series) else atr
+    # Verwende echten ATR(14) aus den Indikatoren
+    atr_value = float(data['ATR14'].dropna().iloc[-1]) if 'ATR14' in data.columns and not data['ATR14'].dropna().empty else float('nan')
     # Kursziel: Unterkante der Zone - ATR * 1.5
-    kursziel = zone_bottom - (atr_value * 1.5)
+    kursziel = zone_bottom - (atr_value * 1.5) if atr_value == atr_value else zone_bottom  # NaN-safe
     # Kursziel anzeigen (z. B. als Text rechts im Chart)
     ax.text(
         data.index[-1] + pd.Timedelta(days=20),  # Position rechts neben letztem Kerzenstand
         kursziel,
         f"Zielbereich: {kursziel:.0f}" if isinstance(kursziel, (int, float)) else f"Zielbereich: {float(kursziel.iloc[-1]):.0f}",
         verticalalignment='center',
-        bbox=dict(facecolor='gray', edgecolor='black', boxstyle='round,pad=0.4'),
+        bbox=dict(facecolor='gray', edgecolor='#111111', boxstyle='round,pad=0.4'),
         fontsize=12,
         color='white'
     )
@@ -1012,19 +1434,19 @@ for count, edge in zip(hist_vals, bin_edges[:-1]):
     ax.barh(y=edge, width=(count / max_volume) * close_series.max() * 0.1, height=(bin_edges[1] - bin_edges[0]), alpha=0.2, color='gray')
 
 
+
+
 # --- Zusätzliche Makro-Charts ---
 
 # JNK vs SPX Chart mit RSI
 def plot_jnk_spx_chart():
     import matplotlib.pyplot as plt
-    import yfinance as yf
-    import pandas as pd
     from ta.momentum import RSIIndicator
     import streamlit as st
 
     # Daten abrufen
-    jnk = yf.download("JNK", start="2023-06-01", end=pd.to_datetime("today"), interval="1d")
-    spx = yf.download("^GSPC", start="2023-06-01", end=pd.to_datetime("today"), interval="1d")
+    jnk = fetch_prices("JNK", start=pd.to_datetime("2023-06-01"), end=pd.to_datetime("today"), interval="1d")
+    spx = fetch_prices("^GSPC", start=pd.to_datetime("2023-06-01"), end=pd.to_datetime("today"), interval="1d")
 
     # RSI berechnen
     jnk['RSI'] = RSIIndicator(close=jnk['Close'].squeeze(), window=14).rsi()
@@ -1035,11 +1457,11 @@ def plot_jnk_spx_chart():
     fig.patch.set_facecolor("white")
     for ax in axs:
         ax.set_facecolor("white")
-        ax.tick_params(axis='x', colors='black')
-        ax.tick_params(axis='y', colors='black')
-        ax.xaxis.label.set_color('black')
-        ax.yaxis.label.set_color('black')
-        ax.title.set_color('black')
+        ax.tick_params(axis='x', colors='#111111')
+        ax.tick_params(axis='y', colors='#111111')
+        ax.xaxis.label.set_color('#111111')
+        ax.yaxis.label.set_color('#111111')
+        ax.title.set_color('#111111')
 
     # RSI
     axs[0].plot(jnk.index, jnk['RSI'], color='red', label='RSI (14)')
@@ -1062,9 +1484,6 @@ def plot_jnk_spx_chart():
     st.pyplot(fig)
 
 def plot_hyg_chart():
-    import yfinance as yf
-    import pandas as pd
-    import streamlit as st
     from ta.momentum import RSIIndicator
     import matplotlib.pyplot as plt
     import matplotlib.dates as mdates
@@ -1074,8 +1493,8 @@ def plot_hyg_chart():
     start = end - pd.DateOffset(years=2)
 
     # Daten laden
-    hyg = yf.download("HYG", start=start, end=end)
-    spx = yf.download("^GSPC", start=start, end=end)
+    hyg = fetch_prices("HYG", start=start, end=end, interval="1d")
+    spx = fetch_prices("^GSPC", start=start, end=end, interval="1d")
 
     # RSI für HYG berechnen
     rsi = RSIIndicator(close=hyg["Close"].squeeze()).rsi()
@@ -1123,17 +1542,14 @@ def plot_hyg_chart():
     st.pyplot(fig)
 
 def plot_vix_chart():
-    import yfinance as yf
-    import pandas as pd
     import matplotlib.pyplot as plt
     from ta.momentum import RSIIndicator
-    import streamlit as st
 
     # Zeitraum: 2 Jahre
     end = pd.Timestamp.today()
     start = end - pd.DateOffset(years=2)
 
-    vix = yf.download("^VIX", start=start, end=end)
+    vix = fetch_prices("^VIX", start=start, end=end, interval="1d")
     if vix.empty or 'Close' not in vix.columns:
         st.warning("VIX-Daten konnten nicht geladen werden.")
         return
@@ -1176,18 +1592,15 @@ def plot_vix_chart():
 
 
 def plot_vix_spx_comparison():
-    import yfinance as yf
-    import pandas as pd
     import matplotlib.pyplot as plt
-    import streamlit as st
     from ta.momentum import RSIIndicator
 
     # Zeitraum: 2 Jahre
     end = pd.Timestamp.today()
     start = end - pd.DateOffset(years=2)
 
-    vix = yf.download("^VIX", start=start, end=end)
-    spx = yf.download("^GSPC", start=start, end=end)
+    vix = fetch_prices("^VIX", start=start, end=end, interval="1d")
+    spx = fetch_prices("^GSPC", start=start, end=end, interval="1d")
 
     if vix.empty or spx.empty:
         st.warning("VIX/SPX Daten konnten nicht geladen werden.")
@@ -1272,7 +1685,8 @@ with tab_macro:
 
 
 # --- New: Multi‑TF Candles (D/W/M/Q) with BB(20,2) and EMA(5) ---
-import plotly.graph_objects as go
+
+
 from ta.volatility import BollingerBands as _BB
 
 def _prep_tf_df(symbol: str, interval: str, years: int = 12):
@@ -1294,6 +1708,28 @@ def _prep_tf_df(symbol: str, interval: str, years: int = 12):
     df['BB_UP'] = bb.bollinger_hband()
     df['BB_LO'] = bb.bollinger_lband()
     return df
+
+def _apply_plotly_theme(fig, title: str = None, height: int = 520):
+    fig.update_layout(
+        template='plotly_white',
+        title=title if title else fig.layout.title.text if fig.layout.title else None,
+        height=height,
+        margin=dict(l=60, r=60, t=60, b=50),
+        plot_bgcolor="#ffffff",
+        paper_bgcolor="#ffffff",
+        font=dict(color="#111111", size=12),
+        legend=dict(
+            bgcolor='rgba(255,255,255,0.95)',
+            bordercolor='#cfcfcf',
+            borderwidth=1,
+            orientation='h',
+            x=0, y=1.05
+        ),
+        hovermode="x unified",
+    )
+    fig.update_xaxes(showgrid=True, gridcolor='#d9d9d9', showline=True, linewidth=1, linecolor='#555')
+    fig.update_yaxes(showgrid=True, gridcolor='#d9d9d9', showline=True, linewidth=1, linecolor='#555')
+    return fig
 
 def _make_tf_figure(df: pd.DataFrame, title: str):
     fig = go.Figure()
@@ -1338,31 +1774,32 @@ def _make_tf_figure(df: pd.DataFrame, title: str):
     ))
 
     # Layout: high contrast white theme
-    fig.update_layout(
-        template='plotly_white',
-        title=title,
-        height=520,
-        margin=dict(l=60, r=60, t=60, b=50),
-        plot_bgcolor="white",
-        paper_bgcolor="white",
-        font=dict(color="black", size=12),
-        legend=dict(
-            bgcolor='rgba(255,255,255,0.95)',
-            bordercolor='#cfcfcf',
-            borderwidth=1,
-            orientation='h',
-            x=0, y=1.05
-        ),
-        hovermode="x unified",
-    )
-    fig.update_xaxes(
-        showgrid=True, gridcolor='#d9d9d9',
-        showline=True, linewidth=1, linecolor='#555'
-    )
-    fig.update_yaxes(
-        showgrid=True, gridcolor='#d9d9d9',
-        showline=True, linewidth=1, linecolor='#555'
-    )
+    # fig.update_layout(
+    #     template='plotly_white',
+    #     title=title,
+    #     height=520,
+    #     margin=dict(l=60, r=60, t=60, b=50),
+    #     plot_bgcolor="#ffffff",
+    #     paper_bgcolor="#ffffff",
+    #     font=dict(color="#111111", size=12),
+    #     legend=dict(
+    #         bgcolor='rgba(255,255,255,0.95)',
+    #         bordercolor='#cfcfcf',
+    #         borderwidth=1,
+    #         orientation='h',
+    #         x=0, y=1.05
+    #     ),
+    #     hovermode="x unified",
+    # )
+    # fig.update_xaxes(
+    #     showgrid=True, gridcolor='#d9d9d9',
+    #     showline=True, linewidth=1, linecolor='#555'
+    # )
+    # fig.update_yaxes(
+    #     showgrid=True, gridcolor='#d9d9d9',
+    #     showline=True, linewidth=1, linecolor='#555'
+    # )
+    _apply_plotly_theme(fig, title=title, height=520)
     return fig
 
 def render_multi_tf_candles(symbol: str):
@@ -1460,8 +1897,9 @@ csv = export_df.to_csv(index=False)
 #st.download_button("📥 Exportiere Buy-/Test-Zonen als CSV", data=csv, file_name=f'{ticker}_zones.csv', mime='text/csv')
 
 # Debug-Check: Sind Daten vollständig?
-st.write(data[['Open', 'High', 'Low', 'Close']].dropna().tail())  # Zeigt letzte 5 Zeilen mit Kursdaten
-st.write(f"Datapoints: {len(data)}")  # Zeigt Anzahl der Zeilen im DataFrame
+if debug_mode:
+    st.write(data[['Open', 'High', 'Low', 'Close']].dropna().tail())  # Zeigt letzte 5 Zeilen mit Kursdaten
+    st.write(f"Datapoints: {len(data)}")  # Zeigt Anzahl der Zeilen im DataFrame
 
 
 st.subheader("📊 Interaktiver Chart")
@@ -1473,20 +1911,87 @@ plot_df = data.copy()
 #test_signals = plot_df['Test Signal'].dropna()
 
 from plotly.subplots import make_subplots
+from datetime import timedelta
+
+# --- Readability helpers ---
+def _extend_x_range(fig, df, days: int = 60):
+    """Extend x‑axis to the right so labels/annotations are not clipped."""
+    if df is None or df.empty:
+        return
+    x0 = pd.to_datetime(df.index.min())
+    x1 = pd.to_datetime(df.index.max()) + pd.Timedelta(days=days)
+    # Apply to both rows
+    fig.update_xaxes(range=[x0, x1], row=1, col=1)
+    fig.update_xaxes(range=[x0, x1], row=2, col=1)
+
+
+def _add_last_price_labels(fig, df, items):
+    """Add right‑side price labels (Close/MA50/MA200 …) with small guide lines."""
+    if df is None or df.empty:
+        return
+    x_last = pd.to_datetime(df.index.max())
+    x_label = x_last + pd.Timedelta(days=15)
+    for (label, series, color) in items:
+        try:
+            s = pd.to_numeric(series, errors='coerce').dropna()
+            if s.empty:
+                continue
+            y = float(s.iloc[-1])
+            # guide line from last candle to annotation
+            fig.add_shape(type="line",
+                          x0=x_last, x1=x_label,
+                          y0=y, y1=y,
+                          line=dict(color=color, width=1, dash='dot'),
+                          row=1, col=1)
+            fig.add_annotation(x=x_label, y=y,
+                               text=f"{label}: {y:.0f}",
+                               showarrow=False,
+                               font=dict(color="#111111", size=12),
+                               bgcolor='rgba(255,255,255,0.95)',
+                               bordercolor=color, borderwidth=1,
+                               xanchor='left', yanchor='middle',
+                               row=1, col=1)
+        except Exception:
+            continue
 fig3 = make_subplots(
     rows=2, cols=1,
     shared_xaxes=True,
     vertical_spacing=0.07,
     row_heights=[0.75, 0.25],
-    subplot_titles=(f"{ticker} – Preis (Candlestick, MA50, MA200, Zonen, Fibonacci)", "RSI (14)")
+    subplot_titles=(f"{ticker} – Preis (Candlestick, MA50, MA200, Zonen, Fibonacci)", "RSI (14 Tage)")
 )
 fig3.update_layout(height=1200)
 
-# Bedingte Anzeige der Indikatoren (alle in row=1, col=1)
+# TradingView-like white theme
+fig3.update_layout(
+    template='plotly_white',
+    paper_bgcolor='#ffffff',
+    plot_bgcolor='#ffffff',
+    margin=dict(l=70, r=200, t=70, b=60),
+    font=dict(size=12, color="#111111"),
+    hoverlabel=dict(bgcolor='white'),
+    hovermode='x unified',
+    dragmode='zoom',
+    legend=dict(font=dict(size=11, color="#111111"),
+                bgcolor='rgba(255,255,255,0.95)',
+                bordercolor='#cfcfcf', borderwidth=1)
+)
+fig3.update_xaxes(showgrid=True, gridcolor='#e5e5e5', tickfont=dict(size=12, color='#111111'), showline=True, linewidth=1, linecolor='#888', row=1, col=1)
+fig3.update_yaxes(showgrid=True, gridcolor='#e5e5e5', tickfont=dict(size=12, color='#111111'), showline=True, linewidth=1, linecolor='#888', tickformat=".0f", row=1, col=1)
+fig3.update_xaxes(showgrid=True, gridcolor='#e5e5e5', tickfont=dict(size=12, color='#111111'), showline=True, linewidth=1, linecolor='#888', row=2, col=1)
+fig3.update_yaxes(showgrid=True, gridcolor='#e5e5e5', tickfont=dict(size=12, color='#111111'), showline=True, linewidth=1, linecolor='#888', tickformat=".0f", row=2, col=1)
+fig3.update_xaxes(rangeslider_visible=False, row=1, col=1)
+
+# TradingView-like crosshair spikes + right-side price scale on main chart
+fig3.update_xaxes(showspikes=True, spikemode='across', spikecolor='#777777', spikethickness=1, row=1, col=1)
+fig3.update_yaxes(showspikes=True, spikemode='across', spikecolor='#777777', spikethickness=1, row=1, col=1, side='right')
+fig3.update_xaxes(showspikes=True, spikemode='across', spikecolor='#777777', spikethickness=1, row=2, col=1)
+fig3.update_yaxes(showspikes=True, spikemode='across', spikecolor='#777777', spikethickness=1, row=2, col=1)
+
 # Bedingte Anzeige der Indikatoren (alle in row=1, col=1)
 if show_indicators:
-    fig3.add_trace(go.Scatter(x=plot_df.index, y=plot_df['MA50'],  name='MA50',  line=dict(color='orange',   width=2.0)), row=1, col=1)
-    fig3.add_trace(go.Scatter(x=plot_df.index, y=plot_df['MA200'], name='MA200', line=dict(color='red',      width=2.2)), row=1, col=1)
+    fig3.add_trace(go.Scatter(x=plot_df.index, y=plot_df['MA50'],  name='MA50',  line=dict(color='orange', width=2.0)), row=1, col=1)
+    fig3.add_trace(go.Scatter(x=plot_df.index, y=plot_df['MA200'], name='MA200', line=dict(color='red', width=2.2)), row=1, col=1)
 
     fig3.add_trace(go.Scatter(x=plot_df.index, y=plot_df['EMA5'],  name='EMA(5)',   line=dict(color='blueviolet', width=1.8)), row=1, col=1)
     fig3.add_trace(go.Scatter(x=plot_df.index, y=plot_df['EMA9'],  name='EMA(9)',   line=dict(color='goldenrod',  width=1.8)), row=1, col=1)
@@ -1499,10 +2004,26 @@ if show_indicators:
     fig3.add_trace(go.Scatter(x=plot_df.index, y=plot_df['MA20'],  name='MA20',  line=dict(color='red',   width=1.6)), row=1, col=1)
     fig3.add_trace(go.Scatter(x=plot_df.index, y=plot_df['MA100'], name='MA100', line=dict(color='brown', width=1.8)), row=1, col=1)
 
-    # Bollinger Bands – nur 1 Legendeneintrag
-    fig3.add_trace(go.Scatter(x=plot_df.index, y=plot_df['BB_upper'], name='Bollinger Bands', line=dict(color='purple', width=1.4), opacity=0.7), row=1, col=1)
-    fig3.add_trace(go.Scatter(x=plot_df.index, y=plot_df['BB_lower'], showlegend=False,       line=dict(color='purple', width=1.4), opacity=0.7), row=1, col=1)
-    fig3.add_trace(go.Scatter(x=plot_df.index, y=plot_df['BB_mid'],   showlegend=False,       line=dict(color='violet', width=1.0),  opacity=0.5), row=1, col=1)
+    # Bollinger Bands – TradingView-like blue style with band fill
+    fig3.add_trace(go.Scatter(
+        x=plot_df.index, y=plot_df['BB_upper'],
+        name='BB(20,2)',
+        line=dict(color='#2a5bd7', width=1.4),
+        opacity=1.0
+    ), row=1, col=1)
+    fig3.add_trace(go.Scatter(
+        x=plot_df.index, y=plot_df['BB_lower'],
+        showlegend=False,
+        line=dict(color='#2a5bd7', width=1.4),
+        fill='tonexty',
+        fillcolor='rgba(42, 91, 215, 0.12)'
+    ), row=1, col=1)
+    fig3.add_trace(go.Scatter(
+        x=plot_df.index, y=plot_df['BB_mid'],
+        name='BB Mid',
+        line=dict(color='#2a5bd7', width=1.0, dash='dot'),
+        showlegend=False
+    ), row=1, col=1)
 
 # # Bedingte Anzeige der Buy/Test Signale (row=1, col=1)
 # if show_signals:
@@ -1515,9 +2036,6 @@ if show_indicators:
 #             x=test_signals.index, y=test_signals, mode='markers', name='Test Signal',
 #             marker=dict(symbol='x', size=10, color='red')), row=1, col=1)
 
-# ==== Neue Overlays: Exakter Haupt-Channel & RSI-Trendlinie (row=1, col=1) ====
-if show_precise_channel:
-    add_precise_channel(fig3, close_series, color="blue", name_prefix="Precise Channel")
 
 # Sidebar-Expander für EMA(5)-Kontext
 with st.sidebar.expander("EMA(5) – Kontext"):
@@ -1551,226 +2069,118 @@ fig3.add_trace(go.Candlestick(
     name='Candlestick'
 ), row=1, col=1)
 
-# --- TradingView-Style Layout & Zonen/Annotationen ---
-from scipy.stats import linregress
-import matplotlib.dates as mdates
+# Extend x‑axis so annotations/labels on the right remain visible
+_extend_x_range(fig3, plot_df, days=90)
 
-"""
-Wedge & Broadening Muster mit Konvergenz-/Divergenzprüfung:
-- Wedge: Linien laufen zusammen (Konvergenz)
-- Broadening: Linien laufen auseinander (Divergenz)
-"""
-def add_wedge_overlay(fig, series, window=60, name_prefix="Wedge"):
-    sub_series = series[-window:]
-    upper_idx = sub_series[sub_series >= sub_series.quantile(0.9)].index
-    lower_idx = sub_series[sub_series <= sub_series.quantile(0.1)].index
+# Last price line (TradingView-style)
+try:
+    last_price_val = float(plot_df_reset['Close'].iloc[-1])
+    fig3.add_hline(y=last_price_val, line=dict(color='#222222', width=1, dash='dot'), row=1, col=1)
+except Exception:
+    pass
 
-    if len(upper_idx) > 1 and len(lower_idx) > 1:
-        x_upper = mdates.date2num(upper_idx.to_pydatetime())
-        y_upper = sub_series[upper_idx]
-        slope_up, intercept_up, _, _, _ = linregress(x_upper, y_upper)
+# Add last‑price labels for key series (improves readability of current levels)
+# Build badge items dynamically based on available columns
+badge_items = [("Close", plot_df['Close'], '#111111')]
+if 'EMA5' in plot_df.columns:
+    badge_items.append(("EMA(5)", plot_df['EMA5'], 'blueviolet'))
+if 'MA20' in plot_df.columns:
+    badge_items.append(("MA20", plot_df['MA20'], 'red'))
+if 'MA50' in plot_df.columns:
+    badge_items.append(("MA50", plot_df['MA50'], 'orange'))
+if 'MA200' in plot_df.columns:
+    badge_items.append(("MA200", plot_df['MA200'], 'red'))
+if 'BB_mid' in plot_df.columns:
+    badge_items.append(("BB Mid", plot_df['BB_mid'], 'purple'))
 
-        x_lower = mdates.date2num(lower_idx.to_pydatetime())
-        y_lower = sub_series[lower_idx]
-        slope_lo, intercept_lo, _, _, _ = linregress(x_lower, y_lower)
+_add_last_price_labels(fig3, plot_df, badge_items)
 
-        # Konvergenz explizit prüfen: Abstand der Linien am Ende < am Anfang
-        x_start = mdates.date2num(sub_series.index[0])
-        x_end = mdates.date2num(sub_series.index[-1])
-        width_start = (slope_up * x_start + intercept_up) - (slope_lo * x_start + intercept_lo)
-        width_end = (slope_up * x_end + intercept_up) - (slope_lo * x_end + intercept_lo)
 
-        if width_end < width_start:
-            x_plot = mdates.date2num(sub_series.index.to_pydatetime())
-            upper_line = slope_up * x_plot + intercept_up
-            lower_line = slope_lo * x_plot + intercept_lo
+# Helper: pretty format for price levels like 6 200 – 6 300
+def _fmt_lvl(v: float) -> str:
+    try:
+        return f"{float(v):,.0f}".replace(",", " ")
+    except Exception:
+        return str(v)
 
-            fig.add_trace(go.Scatter(x=sub_series.index, y=upper_line,
-                                     mode='lines', line=dict(color='yellow', width=2),
-                                     name=f"{name_prefix} Top"))
-            fig.add_trace(go.Scatter(x=sub_series.index, y=lower_line,
-                                     mode='lines', line=dict(color='yellow', width=2),
-                                     name=f"{name_prefix} Bottom"))
-            fig.add_shape(type="rect",
-                          x0=sub_series.index[0], x1=sub_series.index[-1],
-                          y0=min(lower_line), y1=max(upper_line),
-                          fillcolor="rgba(255, 255, 0, 0.05)", line=dict(width=0),
-                          layer="below")
+# Confluence-Zonen als Bänder (row=1, col=1) – TV-like Blue Style + Range Labels
+# Filter nach Mindest-Score und nummerieren je Typ
+zones_filtered = [z for z in confluence_zones if z['score'] >= selected_min_score]
+# sort by price; buys von unten, tests von oben
+buy_z = [z for z in zones_filtered if z.get('type') == 'buy']
+Test_z = [z for z in zones_filtered if z.get('type') == 'test']
+buy_z.sort(key=lambda z: z['mid'])
+Test_z.sort(key=lambda z: z['mid'], reverse=True)
 
-def add_broadening_overlay(fig, series, window=80, name_prefix="Broadening"):
-    sub_series = series[-window:]
-    upper_idx = sub_series[sub_series >= sub_series.quantile(0.9)].index
-    lower_idx = sub_series[sub_series <= sub_series.quantile(0.1)].index
+# Numerierung für Label
+for idx, z in enumerate(buy_z, 1):
+    z['idx'] = idx
+for idx, z in enumerate(Test_z, 1):
+    z['idx'] = idx
 
-    if len(upper_idx) > 1 and len(lower_idx) > 1:
-        x_upper = mdates.date2num(upper_idx.to_pydatetime())
-        y_upper = sub_series[upper_idx]
-        slope_up, intercept_up, _, _, _ = linregress(x_upper, y_upper)
-
-        x_lower = mdates.date2num(lower_idx.to_pydatetime())
-        y_lower = sub_series[lower_idx]
-        slope_lo, intercept_lo, _, _, _ = linregress(x_lower, y_lower)
-
-        # Divergenz explizit prüfen: Abstand der Linien am Ende > am Anfang
-        x_start = mdates.date2num(sub_series.index[0])
-        x_end = mdates.date2num(sub_series.index[-1])
-        width_start = (slope_up * x_start + intercept_up) - (slope_lo * x_start + intercept_lo)
-        width_end = (slope_up * x_end + intercept_up) - (slope_lo * x_end + intercept_lo)
-
-        if width_end > width_start:
-            x_plot = mdates.date2num(sub_series.index.to_pydatetime())
-            upper_line = slope_up * x_plot + intercept_up
-            lower_line = slope_lo * x_plot + intercept_lo
-
-            fig.add_trace(go.Scatter(x=sub_series.index, y=upper_line,
-                                     mode='lines', line=dict(color='cyan', width=2),
-                                     name=f"{name_prefix} Top"))
-            fig.add_trace(go.Scatter(x=sub_series.index, y=lower_line,
-                                     mode='lines', line=dict(color='cyan', width=2),
-                                     name=f"{name_prefix} Bottom"))
-            fig.add_shape(type="rect",
-                          x0=sub_series.index[0], x1=sub_series.index[-1],
-                          y0=min(lower_line), y1=max(upper_line),
-                          fillcolor="rgba(0, 255, 255, 0.05)", line=dict(width=0),
-                          layer="below")
-
-def add_flag_channel(fig, series, window=50, name_prefix="Flag"):
-    sub_series = series[-window:]
-    mid = sub_series.median()
-    offset = sub_series.std() * 0.5
-
-    x_vals = np.arange(len(sub_series))
-    upper_line = np.full_like(x_vals, mid + offset, dtype=np.float64)
-    lower_line = np.full_like(x_vals, mid - offset, dtype=np.float64)
-
-    fig.add_trace(go.Scatter(x=sub_series.index, y=upper_line,
-                             mode='lines', line=dict(color='magenta', dash='dash', width=2),
-                             name=f"{name_prefix} Top"))
-    fig.add_trace(go.Scatter(x=sub_series.index, y=lower_line,
-                             mode='lines', line=dict(color='magenta', dash='dash', width=2),
-                             name=f"{name_prefix} Bottom"))
-    fig.add_shape(type="rect",
-                  x0=sub_series.index[0], x1=sub_series.index[-1],
-                  y0=lower_line[0], y1=upper_line[0],
-                  fillcolor="rgba(255, 0, 255, 0.05)", line=dict(width=0),
-                  layer="below")
-
-def add_bb_breakouts(fig, df, name_prefix="BB Breakout"):
-    if "BB_upper" in df.columns and "BB_lower" in df.columns:
-        breakouts_above = df[df["Close_Series"] > df["BB_upper"]]
-        breakouts_below = df[df["Close_Series"] < df["BB_lower"]]
-
-        if not breakouts_above.empty:
-            fig.add_trace(go.Scatter(x=breakouts_above.index, y=breakouts_above["Close_Series"],
-                                     mode='markers', marker=dict(color='lime', size=8, symbol='triangle-up'),
-                                     name=f"{name_prefix} Above"))
-        if not breakouts_below.empty:
-            fig.add_trace(go.Scatter(x=breakouts_below.index, y=breakouts_below["Close_Series"],
-                                     mode='markers', marker=dict(color='red', size=8, symbol='triangle-down'),
-                                     name=f"{name_prefix} Below"))
-# Hintergrund & Grid anpassen (TradingView-Style) für beide Subplots
-fig3.update_layout(
-    plot_bgcolor="white",
-    paper_bgcolor="white",
-    font=dict(color="black"),
-    hovermode="x unified",
-    title=dict(
-        text=f"{ticker} – Interaktiver Chart",
-        x=0.5, xanchor='center',
-        font=dict(size=16, color='black')
-    ),
-    height=1200,
-    margin=dict(l=60, r=180, t=80, b=60),
-    legend=dict(
-        bgcolor='rgba(255,255,255,0.95)',
-        bordercolor='gray', borderwidth=1,
-        font=dict(size=12),
-        x=1.02, xanchor='left', y=1.0,
-        orientation='v', itemsizing='trace'
-    )
-)
-fig3.update_xaxes(
-    gridcolor='#e6e6e6',
-    showline=True, linewidth=1, linecolor='#999999',
-    showspikes=True, spikecolor='black', spikethickness=1, spikedash='dot',
-    rangeslider_visible=False,
-    row=1, col=1
-)
-fig3.update_xaxes(
-    gridcolor='#e6e6e6',
-    showline=True, linewidth=1, linecolor='#999999',
-    showspikes=True, spikecolor='black', spikethickness=1, spikedash='dot',
-    rangeslider_visible=False,
-    row=2, col=1
-)
-fig3.update_yaxes(
-    gridcolor='#e6e6e6',
-    showline=True, linewidth=1, linecolor='#666666',
-    showspikes=True, spikecolor="black", spikethickness=1, spikedash='dot',
-    title_text="Preis",
-    row=1, col=1
-)
-fig3.update_yaxes(
-    gridcolor='#e6e6e6',
-    showline=True, linewidth=1, linecolor='#666666',
-    title_text="RSI",
-    range=[0, 100],
-    row=2, col=1
-)
-
-# Confluence-Zonen als Bänder (row=1, col=1)
-for zone in confluence_zones:
-    band_color = "rgba(0, 255, 0, 0.07)" if zone['score'] == 3 else \
-                 "rgba(255, 165, 0, 0.07)" if zone['score'] == 2 else \
-                 "rgba(128, 128, 128, 0.05)"
-
+def _draw_zone(z, name_prefix: str):
+    # Farben – Blau wie im Beispiel, leichte Variation für Typen
+    fill = 'rgba(42, 91, 215, 0.14)' if z.get('type') == 'test' else 'rgba(42, 91, 215, 0.10)'
+    border = '#2a5bd7'
+    # Band
     fig3.add_shape(
         type="rect",
-        x0=plot_df.index[0],
-        x1=plot_df.index[-1],
-        y0=zone['low'],
-        y1=zone['high'],
-        fillcolor=band_color,
-        line=dict(width=0),
-        layer='below',
-        row=1, col=1
+        x0=plot_df.index[0], x1=plot_df.index[-1],
+        y0=z['low'], y1=z['high'],
+        fillcolor=fill,
+        line=dict(color=border, width=1),
+        layer='below', row=1, col=1
     )
+    # Outline-Linien
+    fig3.add_hline(y=z['low'], line=dict(color=border, width=1, dash='dot'), row=1, col=1)
+    fig3.add_hline(y=z['high'], line=dict(color=border, width=1, dash='dot'), row=1, col=1)
+    # Range-Text links im Band
+    rng = f"{_fmt_lvl(z['low'])}–{_fmt_lvl(z['high'])}"
+    label = f"{name_prefix} {z.get('idx', '')}  {rng}"
     fig3.add_annotation(
-        x=plot_df.index[-1],
-        y=zone['level'],
-        text=f"{zone['score']}/3",
+        x=plot_df.index[int(len(plot_df)*0.02)],
+        y=(z['low'] + z['high'])/2,
+        text=label,
         showarrow=False,
-        font=dict(size=12, color='black'),
+        font=dict(size=13, color='#0f1d3a'),
         bgcolor='rgba(255,255,255,0.9)',
-        bordercolor='gray',
-        borderwidth=1,
-        xanchor='left',
-        row=1, col=1
+        bordercolor=border, borderwidth=1,
+        xanchor='left', yanchor='middle', row=1, col=1
     )
 
-rsi_series = data['RSI'].dropna()
-rsi_series = data['RSI'].dropna()
-fig3.add_trace(
-    go.Scatter(x=rsi_series.index, y=rsi_series, name='RSI (14)', line=dict(color='deepskyblue', width=2)),
-    row=2, col=1
-)
-fig3.add_hline(y=float(70), line=dict(color='gray', dash='dash'), row=2, col=1)
-fig3.add_hline(y=float(30), line=dict(color='gray', dash='dash'), row=2, col=1)
+for z in Test_z:
+    _draw_zone(z, "Test Zone")
+for z in buy_z:
+    _draw_zone(z, "Buy Zone")
+
+# --- Zonen-Validierung unterhalb des Charts ---
+with tab_chart:
+    st.markdown("---")
+    st.markdown("#### 🔎 Zonen-Validierung (Forward-Test)")
+    eval_res = evaluate_confluence_zones(data, confluence_zones, lookahead=10)
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Anzahl getesteter Zonen", f"{eval_res['count']}")
+    c2.metric("Trefferquote (±0.5 ATR Ausbruch)", f"{(eval_res['hit_rate']*100):.1f}%" if pd.notna(eval_res['hit_rate']) else "–")
+    c3.metric("Ø Vorwärtsrendite (10 Bars)", f"{eval_res['avg_forward_return_%']:.2f}%" if pd.notna(eval_res['avg_forward_return_%']) else "–")
+    st.caption("Heuristische Metriken – für robuste Aussage sollten Walk‑Forward‑Backtests pro Regel/Parameter durchgeführt werden.")
+
+rsi_series = data['RSI'].dropna() if 'RSI' in data.columns else pd.Series(dtype=float)
+if not rsi_series.empty:
+    fig3.add_trace(
+        go.Scatter(
+            x=rsi_series.index,
+            y=rsi_series,
+            name='RSI (14)',
+            line=dict(color='deepskyblue', width=2)
+        ),
+        row=2, col=1
+    )
+    # Add reference lines at 70 and 30, and set y-axis range for RSI subplot
+    fig3.add_hline(y=70, line=dict(color='gray', dash='dash'), row=2, col=1)
+    fig3.add_hline(y=30, line=dict(color='gray', dash='dash'), row=2, col=1)
+    fig3.update_yaxes(title_text="RSI (14 Tage)", range=[0, 100], row=2, col=1)
 
 # --- Chartmuster: Channel Overlay (TradingView-Style) ---
-# Diese Overlays werden in der vereinfachten Ansicht komplett deaktiviert
-if not vereinfachte_trading:
-    show_channels = st.sidebar.checkbox("📐 Channel Overlay anzeigen", value=False)
-    show_wedge = st.sidebar.checkbox("📐 Wedge Overlay", value=False)
-    show_broadening = st.sidebar.checkbox("📈 Broadening Overlay", value=False)
-    show_flag = st.sidebar.checkbox("🏁 Flag/Trendkanal Overlay", value=False)
-    show_bb_breakouts = st.sidebar.checkbox("💥 BB Breakouts", value=False)
-else:
-    show_channels = False
-    show_wedge = False
-    show_broadening = False
-    show_flag = False
-    show_bb_breakouts = False
 
 if vereinfachte_trading:
     # Vereinfachte Trading-Ansicht: RSI-Subplot direkt in den Hauptchart integrieren
@@ -1816,7 +2226,7 @@ if vereinfachte_trading:
             y=zone['level'],
             text=f"{zone['score']}/3",
             showarrow=False,
-            font=dict(size=10, color='black'),
+            font=dict(size=10, color='#111111'),
             bgcolor='rgba(255,255,255,0.9)',
             bordercolor='gray',
             borderwidth=1,
@@ -1857,14 +2267,14 @@ if vereinfachte_trading:
     fig3.add_hline(y=float(30), line=dict(color='gray', dash='dash'), row=2, col=1)
     # Layout
     fig3.update_layout(
-        plot_bgcolor="white",
-        paper_bgcolor="white",
-        font=dict(color="black"),
+        plot_bgcolor="#ffffff",
+        paper_bgcolor="#ffffff",
+        font=dict(color="#111111"),
         hovermode="x unified",
         title=dict(
             text=f"{ticker} – Vereinfachte Trading-Ansicht",
             x=0.5, xanchor='center',
-            font=dict(size=16, color='black')
+            font=dict(size=16, color='#111111')
         ),
         height=900
     )
@@ -1891,58 +2301,6 @@ if vereinfachte_trading:
     )
     # st.plotly_chart(fig3, use_container_width=True)
 else:
-    # --- Original Chartmuster-Overlay-Aufrufe und Fibonacci/Extensions ---
-    if show_channels:
-        # Für Beispiel: letzten 60 Punkte verwenden
-        channel_window = 60
-        channel_data = close_series[-channel_window:]
-        x_vals = np.arange(len(channel_data))
-
-        # Regressionslinien für obere und untere Extrempunkte
-        upper_quantile = channel_data.quantile(0.9)
-        lower_quantile = channel_data.quantile(0.1)
-
-        upper_idx = channel_data[channel_data >= upper_quantile].index
-        lower_idx = channel_data[channel_data <= lower_quantile].index
-
-        # Falls nicht genug Punkte für Regression, überspringen
-        if len(upper_idx) > 1 and len(lower_idx) > 1:
-            # Numerische X-Achsen für Regression
-            x_upper = mdates.date2num(upper_idx.to_pydatetime())
-            y_upper = channel_data[upper_idx]
-            from scipy.stats import linregress
-            slope_up, intercept_up, _, _, _ = linregress(x_upper, y_upper)
-
-            x_lower = mdates.date2num(lower_idx.to_pydatetime())
-            y_lower = channel_data[lower_idx]
-            slope_lo, intercept_lo, _, _, _ = linregress(x_lower, y_lower)
-
-            x_plot = mdates.date2num(channel_data.index.to_pydatetime())
-            upper_line = slope_up * x_plot + intercept_up
-            lower_line = slope_lo * x_plot + intercept_lo
-
-            # Channel-Bänder in Plotly
-            fig3.add_trace(go.Scatter(
-                x=channel_data.index, y=upper_line,
-                mode='lines', line=dict(color='lime', width=2), name='Channel Top'
-            ))
-            fig3.add_trace(go.Scatter(
-                x=channel_data.index, y=lower_line,
-                mode='lines', line=dict(color='red', width=2), name='Channel Bottom'
-            ))
-            fig3.add_trace(go.Scatter(
-                x=channel_data.index, y=(upper_line + lower_line) / 2,
-                mode='lines', line=dict(color='orange', dash='dash', width=1.5), name='Channel Mid'
-            ))
-
-            # Rechteck als Hintergrund (optional)
-            fig3.add_shape(
-                type="rect",
-                x0=channel_data.index[0], x1=channel_data.index[-1],
-                y0=min(lower_line), y1=max(upper_line),
-                fillcolor="rgba(0, 255, 0, 0.05)", line=dict(width=0),
-                layer="below"
-            )
 
     # Fibonacci-Extensions in hellgrau
     for lvl, val in fib_ext.items():
@@ -1956,7 +2314,7 @@ else:
             y=val,
             text=f"Ext {lvl}",
             showarrow=False,
-            font=dict(size=12, color='#aaaaaa'),
+            font=dict(size=12, color='#111111'),
             bgcolor='rgba(0,0,0,0.3)',
             bordercolor='#666666',
             borderwidth=1,
@@ -1975,33 +2333,23 @@ else:
             y=val,
             text=f"Fib {lvl}",
             showarrow=False,
-            font=dict(size=12, color='#444444'),
+            font=dict(size=12, color='#111111'),
             bgcolor='rgba(255,255,255,0.85)',
             bordercolor='#555555',
             borderwidth=1,
             xanchor='right'
         )
 
-    # --- Chartmuster-Overlay-Aufrufe ---
-    if show_wedge:
-        add_wedge_overlay(fig3, close_series, window=60, name_prefix="Wedge")
-
-    if show_broadening:
-        add_broadening_overlay(fig3, close_series, window=80, name_prefix="Broadening")
-
-    if show_flag:
-        add_flag_channel(fig3, close_series, window=50, name_prefix="Flag")
-
-    if show_bb_breakouts:
-        add_bb_breakouts(fig3, data, name_prefix="BB Breakout")
 # --- Verbesserte Confluence-Zonen-Darstellung mit Rechtecken & Tabelle ---
 
 # Tabelle vorbereiten
 zones_table_df = pd.DataFrame([{
+    "Type": zone.get('type', ''),
+    "Range": f"{_fmt_lvl(zone['low'])}–{_fmt_lvl(zone['high'])}",
     "Level (Mid)": round(zone["mid"], 2),
     "Lower Band": round(zone["low"], 2),
     "Upper Band": round(zone["high"], 2),
-    "Score": f"{zone['score']}/3"
+    "Score": zone['score']
 } for zone in confluence_zones])
 
 # Tabelle anzeigen (automatisch aktualisiert mit Prominenz-Slider)
@@ -2009,33 +2357,19 @@ with tab_chart:
     st.subheader("📄 Übersicht der Confluence Zonen")
     st.dataframe(zones_table_df)
 
-# Zonen als Rechtecke (Shapes) in Plotly-Chart
-for zone in confluence_zones:
-    color = "rgba(0, 255, 0, 0.2)" if zone["score"] == 3 else "rgba(255, 165, 0, 0.2)" if zone["score"] == 2 else "rgba(128, 128, 128, 0.2)"
-    fig3.add_shape(
-        type="rect",
-        x0=plot_df.index[0],  # links über ganzen Chart
-        x1=plot_df.index[-1], # rechts
-        y0=zone["low"],
-        y1=zone["high"],
-        line=dict(color=color.replace("0.2", "1.0"), width=1),
-        fillcolor=color,
-        layer="below"
-    )
-    # Preis-Annotation
-    label = f"{zone['low']:.0f}–{zone['high']:.0f}\n({zone['score']}/3)"
-    fig3.add_annotation(
-        x=plot_df.index[-1],
-        y=zone["mid"],
-        text=label,
-        showarrow=False,
-        font=dict(size=12, color="black"),
-        bgcolor="rgba(255,255,255,0.9)",
-        bordercolor="gray",
-        borderwidth=1,
-        xanchor="left"
-    )
-#
+# --- Auto-Tuning Ergebnisse anzeigen -----------------------------------------
+with tab_chart:
+    if isinstance(st.session_state.get('autotune_best'), dict):
+        st.markdown("### 🔬 Auto-Tuning – beste Kombination")
+        best = st.session_state['autotune_best']
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Beste Prominenz", str(best.get('prominence')))
+        c2.metric("Min-Score", str(best.get('min_score')))
+        c3.metric("Merge-Tol (%)", f"{best.get('merge_tol_pct',0)*100:.2f}")
+        c4.metric("Hit-Rate", f"{best.get('hit_rate%', '–')}%")
+    if not st.session_state.get('autotune_df', pd.DataFrame()).empty:
+        st.dataframe(st.session_state['autotune_df'])
+
 # --- Erweiterung: Profi-Kommentar zur RSI-Interpretation (aus Screenshot) ---
 with st.expander("🧠 Profi-Insight: RSI verstehen & Kontext", expanded=False):
     st.markdown("""
@@ -2059,7 +2393,7 @@ if show_lstm:
     st.info("Der Forecast wird mit Unsicherheitsband (±1σ) und Reversionslogik berechnet. Basierend auf Closing, EMA5 und MA20 sowie VIX.")
 
     # VIX laden
-    vix_df = yf.download("^VIX", start=start_date, end=end_date)
+    vix_df = fetch_prices("^VIX", start=start_date, end=end_date, interval="1d")
     vix_df['VIX_SMA5'] = vix_df['Close'].rolling(window=5).mean()
     vix_df['VIX_RSI'] = RSIIndicator(close=vix_df['Close'].squeeze(), window=14).rsi()
     vix_df['VIX_Change'] = vix_df['Close'].pct_change()
@@ -2068,7 +2402,17 @@ if show_lstm:
     vix_df = vix_df[['Close', 'VIX_SMA5', 'VIX_RSI', 'VIX_Change', 'Month']]
     vix_df.rename(columns={'Close': 'VIX_Close'}, inplace=True)
 
-    features_df = data.join(vix_df, how='left')
+    # --- Defensive normalization before join: flatten columns & ensure DatetimeIndex ---
+    if isinstance(data.columns, pd.MultiIndex):
+        data = data.copy()
+        data.columns = data.columns.get_level_values(0)
+    if isinstance(vix_df.columns, pd.MultiIndex):
+        vix_df = vix_df.copy()
+        vix_df.columns = vix_df.columns.get_level_values(0)
+    data.index = pd.to_datetime(data.index)
+    vix_df.index = pd.to_datetime(vix_df.index)
+
+    features_df = data.join(vix_df, how='left', rsuffix='_vix')
     features_df = features_df[['Close_Series', 'RSI', 'MA50', 'MA20', 'EMA5',
                                'VIX_Close', 'VIX_SMA5', 'VIX_RSI', 'VIX_Change', 'Month']]
     features_df['RSI_Change'] = features_df['RSI'].diff()
@@ -2199,7 +2543,15 @@ if show_lstm:
 
 
 with tab_chart:
-    st.plotly_chart(fig3, use_container_width=True)
+    st.plotly_chart(
+        fig3,
+        use_container_width=True,
+        config={
+            "scrollZoom": True,
+            "displaylogo": False,
+            "modeBarButtonsToAdd": ["drawline", "drawrect", "toggleSpikelines"]
+        }
+    )
 
 
 
