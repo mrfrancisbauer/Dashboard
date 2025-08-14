@@ -1263,7 +1263,7 @@ tab_chart, tab_forecast, tab_log, tab_macro, tab_sector, tab_mtf, tab_live, tab_
 ])
 
 
-start_date = st.sidebar.date_input("📅 Startdatum", value=pd.to_datetime("2024-01-01"))
+start_date = st.sidebar.date_input("📅 Startdatum", value=pd.to_datetime("2022-01-01"))
 # Set default end date to tomorrow (today + 1 day), but only as default; if the user selects another date, use that.
 default_end_date = pd.to_datetime("today") + pd.Timedelta(days=1)
 end_date = st.sidebar.date_input("📅 Enddatum", value=default_end_date)
