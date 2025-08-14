@@ -690,7 +690,6 @@ def _compute_market_snapshot_metrics(tickers: list[str]) -> pd.DataFrame:
             rows.append({"ticker": tk})
     return pd.DataFrame(rows)
 
-
 def render_investing_tab():
     """Render a compact stock screener tab based on the hand-drawn framework."""
     import streamlit as _st
