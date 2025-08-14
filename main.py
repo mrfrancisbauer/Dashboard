@@ -1363,7 +1363,6 @@ with tab_log:
 
         # Verlauf (Kumulierter PnL)
         st.line_chart(tdf.set_index('trade_date')['cum_pnl'])
-
         # Tabelle
         st.dataframe(tdf, use_container_width=True)
 
