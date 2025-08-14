@@ -484,6 +484,7 @@ def compute_investing_scores(df: pd.DataFrame, style: str = "garp") -> pd.DataFr
     df['passes_quality'] = (df['quality_score'] >= 60).fillna(False)
     df['passes_price']   = (df['value_score']   >= 60).fillna(False)
     return df
+
 # ---------- End-to-end Persistieren eines Screens ----------
 def persist_investing_run(df: pd.DataFrame, params: dict, style: str = "garp", db_path: str = DB_PATH) -> int:
     """
