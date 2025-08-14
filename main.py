@@ -654,6 +654,7 @@ def _compute_screener_metrics(tk: str):
         "ev": ev
     }
 
+
 # --- Helper: Market snapshot metrics for Investing persistence ---
 def _compute_market_snapshot_metrics(tickers: list[str]) -> pd.DataFrame:
     rows = []
