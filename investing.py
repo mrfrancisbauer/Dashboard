@@ -2,7 +2,7 @@
 # DB-Persistenz & Scoring für den Investing-Tab
 from __future__ import annotations
 import sqlite3, json
-from datetime import datetime
+from datetime import datetime, date
 import numpy as np
 import pandas as pd
 
@@ -713,84 +713,3 @@ def render_investing_analysis(ticker: str, benchmark: str = "SPY"):
             _st.plotly_chart(fig, use_container_width=True)
         except Exception:
             pass
-
-def upsert_market_snapshots(df_snap: pd.DataFrame, db_path: str) -> int:
-    """
-    Upsert market snapshot metrics in die Tabelle `market_snapshots`.
-
-    Erwartete Spalten in df_snap:
-      - ticker (str)
-      - snap_date (str/Datetime, ISO yyyy-mm-dd)   [optional; default = heute]
-      - price (float)            [optional]
-      - market_cap (float)       [optional]
-      - ev (float)               [optional]
-      - total_return_3m (float)  [optional]
-      - total_return_6m (float)  [optional]
-      - total_return_12m (float) [optional]
-      - above_ma200 (bool/int)   [optional; wird zu 0/1 normalisiert]
-    Return: Anzahl der geschriebenen Zeilen.
-    """
-    if df_snap is None or df_snap.empty:
-        return 0
-
-    df = df_snap.copy()
-    df['ticker'] = df['ticker'].astype(str)
-
-    # snap_date normalisieren
-    if 'snap_date' not in df.columns or df['snap_date'].isna().all():
-        df['snap_date'] = date.today().isoformat()
-    else:
-        df['snap_date'] = pd.to_datetime(df['snap_date']).dt.date.astype(str)
-
-    # fehlende numerische Spalten auffüllen
-    for c in ['price','market_cap','ev','total_return_3m','total_return_6m','total_return_12m']:
-        if c not in df.columns:
-            df[c] = np.nan
-
-    # above_ma200 → 0/1
-    if 'above_ma200' not in df.columns:
-        df['above_ma200'] = np.nan
-    df['above_ma200'] = df['above_ma200'].apply(
-        lambda v: 1 if (isinstance(v, (int, float, bool)) and pd.notna(v) and float(v) != 0.0) else 0
-    )
-
-    rows = list(
-        df[['ticker','snap_date','price','market_cap','ev',
-            'total_return_3m','total_return_6m','total_return_12m','above_ma200'
-        ]].itertuples(index=False, name=None)
-    )
-
-    with sqlite3.connect(db_path) as con:
-        cur = con.cursor()
-        # Tabelle sicherstellen (idempotent)
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS market_snapshots (
-                ticker TEXT NOT NULL,
-                snap_date TEXT NOT NULL,
-                price REAL,
-                market_cap REAL,
-                ev REAL,
-                total_return_3m REAL,
-                total_return_6m REAL,
-                total_return_12m REAL,
-                above_ma200 INTEGER,
-                PRIMARY KEY (ticker, snap_date)
-            );
-        """)
-        # Upsert
-        cur.executemany("""
-            INSERT INTO market_snapshots
-                (ticker, snap_date, price, market_cap, ev,
-                 total_return_3m, total_return_6m, total_return_12m, above_ma200)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(ticker, snap_date) DO UPDATE SET
-                price=excluded.price,
-                market_cap=excluded.market_cap,
-                ev=excluded.ev,
-                total_return_3m=excluded.total_return_3m,
-                total_return_6m=excluded.total_return_6m,
-                total_return_12m=excluded.total_return_12m,
-                above_ma200=excluded.above_ma200;
-        """, rows)
-        con.commit()
-        return len(rows)
