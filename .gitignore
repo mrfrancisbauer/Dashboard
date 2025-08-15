@@ -1,0 +1,20 @@
+# Datenbanken
+*.db
+*.sqlite
+*.sqlite3
+/data/**
+
+# ML-Modelle / Checkpoints
+*.h5
+*.hdf5
+*.pt
+*.pth
+*.ckpt
+*.onnx
+/models/**
+*.pkl
+*.joblib
+
+# Optional: nur Ordner behalten
+!data/.gitkeep
+!models/.gitkeep
