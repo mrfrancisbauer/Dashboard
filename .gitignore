@@ -29,6 +29,10 @@ __pycache__/
 *.tar
 *.keras
 
+# Model-Ordner & Logs
+/models/**
+/darts_logs/**
+
 # Optional: nur Ordner behalten
 !data/.gitkeep
 !models/.gitkeep
