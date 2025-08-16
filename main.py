@@ -1225,7 +1225,7 @@ with st.sidebar.expander("📘 Tickerliste (Beispiele)"):
     st.markdown("""
     **Indizes**
     - ^GSPC → S&P 500  
-    - ^NDX → Nasdaq 100  
+    - NDX → Nasdaq 100  
     - ^DJI → Dow Jones  
     - ^RUT → Russell 2000  
     - ^GDAXI → Dax 40
@@ -1375,6 +1375,7 @@ with tab_log:
         )
     else:
         st.info("Noch keine Einträge vorhanden.")
+
 ## Remove sliders for RSI/MA/Volume thresholds, use fixed defaults
 rsi_buy_threshold = 30
 #rsi_test_threshold = 50
@@ -2547,6 +2548,14 @@ def _prep_tf_df(symbol: str, interval: str, years: int = 12):
         df['RSI14'] = _RSI(close=close, window=14).rsi()
     except Exception:
         df['RSI14'] = np.nan
+    # Zusätzliche Durchschnitte: MA10, MA20, EMA14, MA50
+    try:
+        df['MA10'] = close.rolling(window=10).mean()
+        df['MA20'] = close.rolling(window=20).mean()
+        df['EMA14'] = close.ewm(span=14, adjust=False).mean()
+        df['MA50'] = close.rolling(window=50).mean()
+    except Exception:
+        pass
     # MA200 (auf diesem TF; bei Monthly/Quarterly ist das eher eine sehr lange Glättung)
     try:
         df['MA200'] = close.rolling(window=200).mean()
@@ -2554,46 +2563,51 @@ def _prep_tf_df(symbol: str, interval: str, years: int = 12):
         pass
     return df
 
-def _apply_plotly_theme(fig, title: str = None, height: int = 560, showlegend: bool = True):
+def _apply_plotly_theme(fig, title=None, height=600, showlegend=True, base_font_size=14):
     fig.update_layout(
-        template='plotly_white',
-        title=title if title else fig.layout.title.text if fig.layout.title else None,
-        height=height,
-        margin=dict(l=70, r=200, t=60, b=60),
-        plot_bgcolor="#ffffff",
-        paper_bgcolor="#ffffff",
-        font=dict(color="#111111", size=12),
-        legend=dict(
-            bgcolor='rgba(255,255,255,0.95)',
-            bordercolor='#cfcfcf', borderwidth=1,
-            orientation='h', x=0, y=1.05, font=dict(size=11, color='#111111')
+        title=dict(
+            text=title,
+            x=0.5,
+            xanchor="center",
+            yanchor="top",
+            font=dict(size=base_font_size+8, color="black")
         ),
-        hovermode="x unified",
-        showlegend=showlegend,
-        dragmode='zoom',
+        height=height,
+        legend=dict(
+            font=dict(size=base_font_size, color="black"),
+            orientation="h",
+            yanchor="bottom",
+            y=1.02,
+            xanchor="left",   # oben links
+            x=0
+        ),
+        margin=dict(l=40, r=20, t=60, b=40),
+        paper_bgcolor="white",
+        plot_bgcolor="white",
+        font=dict(size=base_font_size, color="black"),
+        xaxis_rangeslider_visible=False
     )
+
     fig.update_xaxes(
-        showgrid=True, gridcolor='#e0e0e0',
-        showline=True, linewidth=1, linecolor='#888',
-        rangeslider_visible=False,
-        rangebreaks=[dict(bounds=["sat", "mon"])],
-        showspikes=True, spikemode='across', spikecolor='#777', spikethickness=1,
+        tickfont=dict(size=base_font_size, color="black"),
+        title=dict(font=dict(size=base_font_size+2, color="black")),
+        gridcolor="lightgrey",
+        zerolinecolor="lightgrey",
+        rangebreaks=[dict(bounds=["sat", "mon"])],  # Wochenenden ausblenden
+        dtick="M1"
     )
     fig.update_yaxes(
-        showgrid=True, gridcolor='#eaeaea',
-        showline=True, linewidth=1, linecolor='#888',
-        side='right',
-        showspikes=True, spikemode='across', spikecolor='#777', spikethickness=1,
-        zeroline=False,
+        tickfont=dict(size=base_font_size, color="black"),
+        title=dict(font=dict(size=base_font_size+2, color="black")),
+        gridcolor="lightgrey",
+        zerolinecolor="lightgrey"
     )
-    return fig
-
 from plotly.subplots import make_subplots as _make_subplots_tf
 
-def _make_tf_figure(df: pd.DataFrame, title: str, show_rsi: bool = True) -> go.Figure:
+def _make_tf_figure(df: pd.DataFrame, title: str, show_rsi: bool = True, add_northman_ma: bool = False) -> go.Figure:
     # Subplots: Preis + (optional) RSI
     if show_rsi:
-        fig = _make_subplots_tf(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.06, row_heights=[0.76, 0.24])
+        fig = _make_subplots_tf(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.06, row_heights=[0.74, 0.26])
     else:
         fig = _make_subplots_tf(rows=1, cols=1)
 
@@ -2601,23 +2615,37 @@ def _make_tf_figure(df: pd.DataFrame, title: str, show_rsi: bool = True) -> go.F
     fig.add_trace(go.Candlestick(
         x=df.index,
         open=df['Open'], high=df['High'], low=df['Low'], close=df['Close'],
-        increasing_line_color='rgb(0,155,0)', decreasing_line_color='rgb(200,0,0)',
+        increasing_line_color='rgb(0, 21, 155)', decreasing_line_color='rgb(200,0,0)',
         increasing_line_width=2.2, decreasing_line_width=2.2,
         name='Candles'
     ), row=1, col=1)
 
     # EMA(5)
     if 'EMA5' in df.columns:
-        fig.add_trace(go.Scatter(x=df.index, y=df['EMA5'], name='EMA(5)', mode='lines', line=dict(width=2.2, color='rgb(90,0,180)')), row=1, col=1)
+        fig.add_trace(go.Scatter(x=df.index, y=df['EMA5'], name='EMA(5)', mode='lines', line=dict(width=2.2, color='rgb(90,0,180)'), connectgaps=True), row=1, col=1)
     # MA200 (Kontext)
     if 'MA200' in df.columns and df['MA200'].notna().any():
-        fig.add_trace(go.Scatter(x=df.index, y=df['MA200'], name='MA(200)', mode='lines', line=dict(width=2.0, color='rgb(220,120,0)', dash='solid')), row=1, col=1)
+        fig.add_trace(go.Scatter(x=df.index, y=df['MA200'], name='MA(200)', mode='lines', line=dict(width=2.0, color='rgb(220,120,0)', dash='solid'), connectgaps=True), row=1, col=1)
+    # --- Northman: zusätzliche MAs/EMAs für Monthly ---
+    if add_northman_ma:
+        if 'MA10' in df.columns:
+            fig.add_trace(go.Scatter(x=df.index, y=df['MA10'], name='MA(10)', mode='lines',
+                                     line=dict(width=1.8, color='#cc3377'), connectgaps=True), row=1, col=1)
+        if 'MA20' in df.columns:
+            fig.add_trace(go.Scatter(x=df.index, y=df['MA20'], name='MA(20)', mode='lines',
+                                     line=dict(width=1.8, color='#0a8f08'), connectgaps=True), row=1, col=1)
+        if 'EMA14' in df.columns:
+            fig.add_trace(go.Scatter(x=df.index, y=df['EMA14'], name='EMA(14)', mode='lines',
+                                     line=dict(width=1.8, color='#d2691e'), connectgaps=True), row=1, col=1)
+        if 'MA50' in df.columns:
+            fig.add_trace(go.Scatter(x=df.index, y=df['MA50'], name='MA(50)', mode='lines',
+                                     line=dict(width=2.0, color='#6a5acd'), connectgaps=True), row=1, col=1)
 
     # Bollinger: Linien + dezente blaue Fläche
     if {'BB_UP','BB_MID','BB_LO'}.issubset(df.columns):
-        fig.add_trace(go.Scatter(x=df.index, y=df['BB_UP'], name='BB Upper', mode='lines', line=dict(dash='dash', width=1.4, color='#2a5bd7')), row=1, col=1)
-        fig.add_trace(go.Scatter(x=df.index, y=df['BB_MID'], name='BB Mid',   mode='lines', line=dict(dash='dot',  width=1.0, color='#2a5bd7'), showlegend=False), row=1, col=1)
-        fig.add_trace(go.Scatter(x=df.index, y=df['BB_LO'], name='BB Lower', mode='lines', line=dict(dash='dash', width=1.4, color='#2a5bd7'), fill='tonexty', fillcolor='rgba(42,91,215,0.12)'), row=1, col=1)
+        fig.add_trace(go.Scatter(x=df.index, y=df['BB_UP'], name='BB Upper', mode='lines', line=dict(dash='dash', width=1.4, color='#2a5bd7'), fill='tonexty', fillcolor='rgba(42,91,215,0.12)', connectgaps=True), row=1, col=1)
+        fig.add_trace(go.Scatter(x=df.index, y=df['BB_MID'], name='BB Mid',   mode='lines', line=dict(dash='dash',  width=1.0, color='#2a5bd7'),fill='tonexty', fillcolor='rgba(42,91,215,0.12)', showlegend=False, connectgaps=True), row=1, col=1)
+        fig.add_trace(go.Scatter(x=df.index, y=df['BB_LO'], name='BB Lower', mode='lines', line=dict(dash='dash', width=1.4, color='#2a5bd7'), fill='tonexty', fillcolor='rgba(42,91,215,0.12)', connectgaps=True), row=1, col=1)
 
     # Last‑price Linie + Badge rechts
     try:
@@ -2627,7 +2655,7 @@ def _make_tf_figure(df: pd.DataFrame, title: str, show_rsi: bool = True) -> go.F
         fig.add_hline(y=y_last, line=dict(color='#222', width=1, dash='dot'), row=1, col=1)
         fig.add_shape(type='line', x0=x_last, x1=x_label, y0=y_last, y1=y_last, line=dict(color='#222', width=1, dash='dot'), row=1, col=1)
         fig.add_annotation(x=x_label, y=y_last, text=f"Close: {y_last:.0f}", showarrow=False,
-                           font=dict(color='#111', size=12), bgcolor='rgba(255,255,255,0.96)',
+                           font=dict(color='#111', size=14), bgcolor='rgba(255,255,255,0.96)',
                            bordercolor='#222', borderwidth=1, xanchor='left', yanchor='middle', row=1, col=1)
     except Exception:
         pass
@@ -2635,13 +2663,30 @@ def _make_tf_figure(df: pd.DataFrame, title: str, show_rsi: bool = True) -> go.F
     # RSI Subplot
     if show_rsi and 'RSI14' in df.columns:
         rsi = pd.to_numeric(df['RSI14'], errors='coerce')
-        fig.add_trace(go.Scatter(x=df.index, y=rsi, name='RSI(14)', mode='lines', line=dict(width=1.6, color='rgb(180,0,0)')), row=2, col=1)
-        # 70/30 Linien
-        fig.add_hline(y=70, line=dict(color='#aaaaaa', width=1, dash='dot'), row=2, col=1)
-        fig.add_hline(y=30, line=dict(color='#aaaaaa', width=1, dash='dot'), row=2, col=1)
+        rsi = rsi.clip(lower=0, upper=100)
+        fig.add_trace(
+            go.Scatter(
+                x=df.index, y=rsi, name='RSI(14)', mode='lines',
+                line=dict(width=1.6, color='rgb(180,0,0)'),
+                connectgaps=True,
+                cliponaxis=False
+            ),
+            row=2, col=1
+        )
+        # 70/30 Linien (leicht breiter für bessere Lesbarkeit)
+        fig.add_hline(y=70, line=dict(color='#aaaaaa', width=1.2, dash='dot'), row=2, col=1)
+        fig.add_hline(y=30, line=dict(color='#aaaaaa', width=1.2, dash='dot'), row=2, col=1)
+        # Fester RSI-Bereich mit großzügigem Puffer und Automargin
+        fig.update_yaxes(autorange=False, range=[-10, 110], tickvals=[0, 30, 50, 70, 100], automargin=True, row=2, col=1)
 
     # Theme & Achsen
-    _apply_plotly_theme(fig, title=title, height=620 if show_rsi else 520, showlegend=True)
+    _apply_plotly_theme(fig, title=title, height=1020 if show_rsi else 320, showlegend=True)
+    # Re-apply RSI axis range und Clipping aus (expanded headroom, automargin)
+    if show_rsi and 'RSI14' in df.columns:
+        fig.update_yaxes(autorange=False, range=[-10, 110], tickvals=[0, 30, 50, 70, 100], automargin=True, row=2, col=1)
+        fig.update_traces(selector=dict(name='RSI(14)'), cliponaxis=False)
+    # Disable range slider (prevents overlap with RSI subplot)
+    fig.update_layout(xaxis_rangeslider_visible=False)
     return fig
 
 def render_multi_tf_candles(symbol: str):
@@ -2665,7 +2710,15 @@ def render_multi_tf_candles(symbol: str):
         st.plotly_chart(_make_tf_figure(w, f"{symbol} – Weekly | Candles · EMA5 · BB(20,2) · MA200", show_rsi=show_rsi_tf), use_container_width=True)
     if not m.empty:
         st.markdown("### Monthly")
-        st.plotly_chart(_make_tf_figure(m, f"{symbol} – Monthly | Candles · EMA5 · BB(20,2) · MA200", show_rsi=show_rsi_tf), use_container_width=True)
+        st.plotly_chart(
+            _make_tf_figure(
+                m,
+                f"{symbol} – Monthly | Candles · EMA5 · BB(20,2) · MA200 · MA(10) · MA(20) · EMA(14) · MA(50)",
+                show_rsi=show_rsi_tf,
+                add_northman_ma=True
+            ),
+            use_container_width=True
+        )
     if not q.empty:
         st.markdown("### Quarterly")
         st.plotly_chart(_make_tf_figure(q, f"{symbol} – Quarterly | Candles · EMA5 · BB(20,2) · MA200", show_rsi=show_rsi_tf), use_container_width=True)
