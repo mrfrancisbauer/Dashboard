@@ -1,3 +1,15 @@
+# Python / Virtualenv
+venv/
+.venv/
+env/
+ENV/
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+.ipynb_checkpoints
+.DS_Store
+
 # Datenbanken
 *.db
 *.sqlite
@@ -14,7 +26,7 @@
 /models/**
 *.pkl
 *.joblib
-+.tar
+*.tar
 *.keras
 
 # Optional: nur Ordner behalten
