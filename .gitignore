@@ -14,6 +14,8 @@
 /models/**
 *.pkl
 *.joblib
++.tar
+*.keras
 
 # Optional: nur Ordner behalten
 !data/.gitkeep
