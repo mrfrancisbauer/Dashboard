@@ -361,7 +361,6 @@ def upsert_market_snapshots(df: pd.DataFrame, snap_date: str, db_path: str = DB_
             )
         conn.commit()
 
-
 def upsert_scores(df_scores: pd.DataFrame, style: str, as_of_date: str | None = None, db_path: str = DB_PATH) -> None:
     if df_scores.empty: return
     as_of_date = as_of_date or datetime.utcnow().date().isoformat()
