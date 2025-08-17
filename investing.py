@@ -7,10 +7,250 @@ import numpy as np
 import pandas as pd
 
 
-DB_PATH = "market_dashboard.db"  # passe an, falls du einen anderen Pfad nutzt
+# Default DB path (can be overridden via set_db_path)
+DB_PATH = "market_dashboard.db"
+
 def set_db_path(db_path: str):
     global DB_PATH
     DB_PATH = db_path
+#
+# ---------- Index Constituents Fetchers & Bulk Upsert ----------
+
+def _clean_symbol(sym: str) -> str:
+    if not isinstance(sym, str):
+        return ""
+    s = sym.strip().upper()
+    # Normalize common unicode chars
+    return s.replace("\xa0", "").replace(" ", "")
+
+
+def fetch_sp500_constituents() -> pd.DataFrame:
+    """Fetch S&P 500 from Wikipedia and return normalized df with columns:
+    ticker, name, sector, industry, currency, country
+    """
+    url = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
+    tables = pd.read_html(url)
+    # Heuristic: first table contains the current list
+    df = tables[0].copy()
+    # Expected columns: Symbol, Security, GICS Sector, GICS Sub-Industry
+    df.rename(columns={
+        'Symbol': 'ticker',
+        'Security': 'name',
+        'GICS Sector': 'sector',
+        'GICS Sub-Industry': 'industry'
+    }, inplace=True)
+    df['ticker'] = df['ticker'].astype(str).map(_clean_symbol)
+    df['name'] = df['name'].astype(str)
+    df['sector'] = df.get('sector', "").astype(str)
+    df['industry'] = df.get('industry', "").astype(str)
+    df['currency'] = 'USD'
+    df['country'] = 'US'
+    return df[['ticker','name','sector','industry','currency','country']].dropna(subset=['ticker'])
+
+
+def fetch_dax40_constituents() -> pd.DataFrame:
+    """Fetch DAX 40 constituents from Wikipedia robustly and normalize to Yahoo (.DE).
+    Returns columns: ticker, name, sector, industry, currency, country
+    """
+    url = "https://en.wikipedia.org/wiki/DAX"
+    tables = pd.read_html(url, header=0)
+
+    def _flatten_cols(df: pd.DataFrame) -> pd.DataFrame:
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = [' '.join([str(x) for x in tup if str(x) != 'nan']).strip() for tup in df.columns]
+        else:
+            df.columns = [str(c) for c in df.columns]
+        return df
+
+    cand = None
+    for t in tables:
+        t = _flatten_cols(t.copy())
+        lower = {c.lower(): c for c in t.columns}
+        cols_l = set(lower.keys())
+        has_company = any(k in cols_l for k in ["company", "name", "constituent", "constituents"])
+        has_ticker  = any(k in cols_l for k in ["ticker", "ticker symbol", "symbol"])
+        # Heuristik: brauchbare Größe (>= 30 Zeilen) und beide Felder vorhanden
+        if has_company and has_ticker and len(t) >= 30:
+            cand = t
+            break
+    if cand is None:
+        # Fallback: nimm die größte Tabelle mit einer 'Company'-artigen Spalte
+        sizes = [(len(t), t) for t in tables]
+        sizes.sort(key=lambda x: x[0], reverse=True)
+        for _, t in sizes:
+            t = _flatten_cols(t.copy())
+            lower = {c.lower(): c for c in t.columns}
+            if any(k in lower for k in ["company", "name", "constituent", "constituents"]):
+                cand = t
+                break
+    if cand is None:
+        return pd.DataFrame(columns=["ticker","name","sector","industry","currency","country"])  # empty
+
+    df = _flatten_cols(cand.copy())
+    L = {c.lower(): c for c in df.columns}
+    def pick(*options):
+        for o in options:
+            if o in L: return L[o]
+        return None
+
+    col_name   = pick("company", "name", "constituent", "constituents")
+    col_ticker = pick("ticker", "ticker symbol", "symbol")
+    col_sector = pick("sector", "industry", "gics sector", "gics sub-industry")
+
+    if col_ticker is None:
+        df["ticker"] = ""
+    else:
+        df["ticker"] = df[col_ticker].astype(str)
+
+    if col_name is None:
+        df["name"] = df.get("Company", df.get("Name", "")).astype(str)
+    else:
+        df["name"] = df[col_name].astype(str)
+
+    if col_sector is None:
+        df["sector"] = ""
+    else:
+        df["sector"] = df[col_sector].astype(str)
+
+    # Clean / Normalize ticker and enforce .DE
+    def _ensure_de(t: str) -> str:
+        t = _clean_symbol(t)
+        if not t:
+            return t
+        # manche Einträge haben mehrere Symbole getrennt durch / oder , → erstes nehmen
+        for sep in ["/", ",", " "]:
+            if sep in t:
+                t = t.split(sep)[0]
+                break
+        if t.endswith('.DE') or '.' in t:
+            return t
+        return f"{t}.DE"
+
+    df['ticker'] = df['ticker'].astype(str).map(_ensure_de)
+    df['industry'] = ''
+    df['currency'] = 'EUR'
+    df['country']  = 'DE'
+
+    out = df[["ticker","name","sector","industry","currency","country"]].dropna(subset=["ticker"]).drop_duplicates("ticker")
+    # Filtere offensichtliche Nicht‑Ticker wie leere Strings
+    out = out[out['ticker'].str.len() >= 3]
+    return out
+
+
+def fetch_nasdaq100_constituents() -> pd.DataFrame:
+    """Fetch NASDAQ‑100 constituents from Wikipedia robustly.
+    Returns columns: ticker, name, sector, industry, currency, country
+    """
+    url = "https://en.wikipedia.org/wiki/NASDAQ-100"
+    tables = pd.read_html(url, header=0)
+
+    def _flatten_cols(df: pd.DataFrame) -> pd.DataFrame:
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = [' '.join([str(x) for x in tup if str(x) != 'nan']).strip() for tup in df.columns]
+        else:
+            df.columns = [str(c) for c in df.columns]
+        return df
+
+    cand = None
+    for t in tables:
+        t = _flatten_cols(t.copy())
+        lower = {c.lower(): c for c in t.columns}
+        cols_l = set(lower.keys())
+        has_company = any(k in cols_l for k in ["company", "name"])
+        has_ticker  = any(k in cols_l for k in ["ticker", "symbol"])
+        # Heuristik: NASDAQ‑100 Tabelle hat typischerweise >= 80 Zeilen
+        if has_company and has_ticker and len(t) >= 80:
+            cand = t
+            break
+    if cand is None:
+        # Fallback: größte passende Tabelle
+        sizes = [(len(t), t) for t in tables]
+        sizes.sort(key=lambda x: x[0], reverse=True)
+        for _, t in sizes:
+            t = _flatten_cols(t.copy())
+            lower = {c.lower(): c for c in t.columns}
+            if any(k in lower for k in ["company", "name"]) and any(k in lower for k in ["ticker", "symbol"]):
+                cand = t
+                break
+    if cand is None:
+        return pd.DataFrame(columns=["ticker","name","sector","industry","currency","country"])  # empty
+
+    df = _flatten_cols(cand.copy())
+    L = {c.lower(): c for c in df.columns}
+    def pick(*options):
+        for o in options:
+            if o in L: return L[o]
+        return None
+
+    col_name   = pick("company", "name")
+    col_ticker = pick("ticker", "symbol")
+    col_sector = pick("sector", "gics sector")
+    col_ind    = pick("industry", "gics sub-industry")
+
+    if col_ticker is None:
+        df["ticker"] = ""
+    else:
+        df["ticker"] = df[col_ticker].astype(str)
+
+    if col_name is None:
+        df["name"] = df.get("Company", df.get("Name", "")).astype(str)
+    else:
+        df["name"] = df[col_name].astype(str)
+
+    df['sector']   = df[col_sector].astype(str) if col_sector else ''
+    df['industry'] = df[col_ind].astype(str) if col_ind else ''
+
+    # Clean tickers
+    def _clean_us(t: str) -> str:
+        t = _clean_symbol(t)
+        if not t:
+            return t
+        for sep in ["/", ",", " "]:
+            if sep in t:
+                t = t.split(sep)[0]
+                break
+        # Entferne Fußnoten‑Superscripts wie '^', '*' etc., falls vorhanden
+        t = t.replace("*", "").replace("^", "")
+        return t
+
+    df['ticker'] = df['ticker'].astype(str).map(_clean_us)
+    df['currency'] = 'USD'
+    df['country']  = 'US'
+
+    out = df[["ticker","name","sector","industry","currency","country"]].dropna(subset=["ticker"]).drop_duplicates("ticker")
+    out = out[out['ticker'].str.len() >= 1]
+    return out
+
+
+def populate_equity_universe(db_path: str = DB_PATH) -> dict:
+    """Fetch S&P500, DAX40, NASDAQ-100 constituents and upsert into companies.
+    Returns dict with counts per index and total.
+    """
+    ensure_investing_tables(db_path)
+    res = {"sp500": 0, "dax40": 0, "nasdaq100": 0, "total": 0}
+    frames = []
+    try:
+        sp = fetch_sp500_constituents(); res["sp500"] = len(sp); frames.append(sp)
+    except Exception:
+        pass
+    try:
+        dx = fetch_dax40_constituents(); res["dax40"] = len(dx); frames.append(dx)
+    except Exception:
+        pass
+    try:
+        nd = fetch_nasdaq100_constituents(); res["nasdaq100"] = len(nd); frames.append(nd)
+    except Exception:
+        pass
+    if not frames:
+        return res
+    all_df = pd.concat(frames, axis=0, ignore_index=True)
+    # dedupe by ticker (prefer latest occurrence)
+    all_df = all_df.dropna(subset=['ticker']).drop_duplicates(subset=['ticker'], keep='last')
+    upsert_companies(all_df, db_path=db_path)
+    res["total"] = len(all_df)
+    return res
+
+
 
 # ---------- DDL: Tabellen anlegen (idempotent) ----------
 DDL = """
@@ -326,19 +566,19 @@ def upsert_market_snapshots(df: pd.DataFrame, snap_date: str, db_path: str = DB_
         for _, row in df.iterrows():
             tk = str(row['ticker'])
             price = None if pd.isna(row['price']) else float(row['price'])
-            mcap  = None if pd.isna(row['market_cap']) else float(row['market_cap'])
-            ev    = None if pd.isna(row['ev']) else float(row['ev'])
-            tr3   = None if pd.isna(row['total_return_3m']) else float(row['total_return_3m'])
-            tr6   = None if pd.isna(row['total_return_6m']) else float(row['total_return_6m'])
-            tr12  = None if pd.isna(row['total_return_12m']) else float(row['total_return_12m'])
+            mcap = None if pd.isna(row['market_cap']) else float(row['market_cap'])
+            ev = None if pd.isna(row['ev']) else float(row['ev'])
+            tr3 = None if pd.isna(row['total_return_3m']) else float(row['total_return_3m'])
+            tr6 = None if pd.isna(row['total_return_6m']) else float(row['total_return_6m'])
+            tr12 = None if pd.isna(row['total_return_12m']) else float(row['total_return_12m'])
             above = None if pd.isna(row['above_ma200']) else float(row['above_ma200'])
 
             # Fallback: aus historical_prices berechnen
             if any(v is None for v in (tr3, tr6, tr12, above)):
                 c3, c6, c12, cabove = _calc_snapshot_metrics_from_db(conn, tk, snap_date)
-                tr3   = tr3   if tr3  is not None else c3
-                tr6   = tr6   if tr6  is not None else c6
-                tr12  = tr12  if tr12 is not None else c12
+                tr3 = tr3 if tr3  is not None else c3
+                tr6 = tr6 if tr6  is not None else c6
+                tr12 = tr12 if tr12 is not None else c12
                 above = above if above is not None else cabove
 
             cur.execute(
@@ -482,7 +722,7 @@ def compute_investing_scores(df: pd.DataFrame, style: str = "garp") -> pd.DataFr
                         w['v']*df['value_score'] + w['m']*df['momentum_score'])
 
     df['passes_quality'] = (df['quality_score'] >= 60).fillna(False)
-    df['passes_price']   = (df['value_score']   >= 60).fillna(False)
+    df['passes_price'] = (df['value_score'] >= 60).fillna(False)
     return df
 
 # ---------- End-to-end Persistieren eines Screens ----------

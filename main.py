@@ -698,6 +698,21 @@ def render_investing_tab():
     import numpy as _np
 
     _st.header("💼 Investing – Stock Screener (Quality & Price)")
+    # Universum laden
+    with st.expander("🧾 Aktien-Universum laden (S&P 500, DAX 40, NASDAQ-100)"):
+        if st.button("In DB speichern", key="btn_populate_universe"):
+            try:
+                from investing import populate_equity_universe, set_db_path
+                set_db_path(DB_PATH)
+                res = populate_equity_universe(DB_PATH)
+                st.success(
+                    f"Gespeichert: {res.get('total', 0)} Ticker – "
+                    f"S&P500 {res.get('sp500', 0)}, "
+                    f"DAX40 {res.get('dax40', 0)}, "
+                    f"NDX100 {res.get('nasdaq100', 0)}"
+                )
+            except Exception as e:
+                st.error(f"Konnte Universum nicht laden: {e}")
 
     with _st.expander("🔧 Einstellungen", expanded=True):
         tickers_text = _st.text_area(
@@ -3229,7 +3244,7 @@ fig3.update_layout(
     plot_bgcolor='#ffffff',
     margin=dict(l=70, r=200, t=70, b=60),
     font=dict(size=12, color="#111111"),
-    hoverlabel=dict(bgcolor='white'),
+    hoverlabel=dict(bgcolor='black'),
     hovermode='x unified',
     dragmode='zoom',
     legend=dict(font=dict(size=11, color="#111111"),
